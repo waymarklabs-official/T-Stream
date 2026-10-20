@@ -169,6 +169,8 @@ systemctl enable --now canvas-prep.timer >/dev/null 2>&1 || warn "could not enab
 # -------------------------------------------------------- Wi-Fi safety net ---
 if command -v nmcli >/dev/null; then
   step "Wi-Fi safety net: if the Pi joins no Wi-Fi within 3 minutes of booting, it starts its hotspot"
+  # Saved hotspot settings (not started), so the safety net never depends on config.json.
+  "$ROOT/bin/hotspot-on.sh" --prepare || warn "could not prepare the hotspot settings"
   cat > /etc/systemd/system/tstream-wifi-fallback.service <<UNIT
 [Unit]
 Description=T-Stream: start the hotspot if no Wi-Fi is joined after boot

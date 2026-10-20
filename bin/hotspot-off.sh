@@ -8,6 +8,8 @@ HERE=$(dirname "$(readlink -f "$0")")
 . "$HERE/wifi-common.sh"
 
 [ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" IFACE="$IFACE" SSH_CONNECTION="${SSH_CONNECTION:-}" "$0" "$@"
+trap '' HUP   # a dropped SSH session must never stop a half-done switch
+need_nmcli
 
 if ! hotspot_active; then
   # not running (e.g. a fallback hotspot was never started): just make sure
@@ -30,8 +32,10 @@ if ssh_over_wifi; then
   detach_from_terminal "hotspot-off"
 fi
 
-nmcli connection modify "$CON" connection.autoconnect no >/dev/null 2>&1 || true
-nmcli connection down "$CON" >/dev/null 2>&1 || true
+# From here on no error may stop the script half-way between networks.
+set +e
+nmcli connection modify "$CON" connection.autoconnect no >/dev/null 2>&1
+nmcli connection down "$CON" >/dev/null 2>&1
 
 if join_home_wifi; then
   echo "Hotspot is OFF. Addresses: $(hostname -I 2>/dev/null)"

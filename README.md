@@ -69,9 +69,10 @@ Wi-Fi or running its hotspot, never both:
 - Switching cuts your SSH session; both commands print what you need to
   reconnect *before* switching, finish on their own, and log to
   `/var/log/tstream-hotspot.log`.
-- **You can't get locked out:** if the hotspot can't start, the Pi goes back
-  to your home Wi-Fi. If `hotspot-off` can't join your home Wi-Fi, the hotspot
-  comes back. If the Pi joins no Wi-Fi within 3 minutes of booting (router off,
+- **You can't get locked out:** nothing working is switched off before its
+  replacement is up. If the hotspot can't start, the Pi goes back to the
+  network it was on. If `hotspot-off` can't join your home Wi-Fi, the hotspot
+  comes back. A bad name or password is refused before anything changes. If the Pi joins no Wi-Fi within 3 minutes of booting (router off,
   or you're away from home), it starts the hotspot by itself until the next
   reboot, so the toy keeps working on trips too.
 - Updates need internet: `hotspot-off`, reconnect over home Wi-Fi,
@@ -137,7 +138,7 @@ app WebViews that ignore user certificates; then just use http:// and MPEG-1.
 | `player.autoResyncMs` | `500` | If the picture falls this far behind the sound, jump to the next keyframe. `0` = off |
 | `player.avOffsetMs` | `0` | Positive = show the picture later (lip-sync fine-tuning for all devices) |
 | `player.bufferSegments` | `3` | Segments fetched ahead (~12 s) |
-| `hotspot` | name, random password, country | Used by `hotspot-on` |
+| `hotspot` | name, random password, country | Used by `hotspot-on`. Name 1-32 bytes, password 8-63 plain characters. `country` is only used if the Pi has no Wi-Fi country set yet |
 
 Run `prep --force` after changing anything above `player`. Player and hotspot
 settings take effect on the next `prep` or `hotspot-on`.

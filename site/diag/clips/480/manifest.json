@@ -1,0 +1,130 @@
+{
+ "format": 1,
+ "id": "480",
+ "title": "480",
+ "category": "diag",
+ "sort": "diag/480.mp4",
+ "duration": 3.0,
+ "v": "f8dad0e0",
+ "audio": [
+  {
+   "format": "opus",
+   "src": "f8dad0e0/audio.opus",
+   "mime": "audio/ogg; codecs=opus",
+   "duration": 3.025104
+  },
+  {
+   "format": "mp3",
+   "src": "f8dad0e0/audio.mp3",
+   "mime": "audio/mpeg",
+   "duration": 3.056327
+  }
+ ],
+ "tracks": [
+  {
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.4D401F",
+   "description": "AU1AH//hABlnTUAf2QDYPefwEQAAAwABAAADADwPGDJIAQAFaOvDyyA=",
+   "width": 852,
+   "height": 480,
+   "fps": 30.0,
+   "fpsFraction": "30/1",
+   "frames": 90,
+   "duration": 3.0,
+   "segmentDuration": 10.0,
+   "segments": [
+    {
+     "i": 0,
+     "start": 0.0,
+     "dur": 3.0,
+     "file": "seg_00000.bin",
+     "bytes": 655208,
+     "frames": 90
+    }
+   ],
+   "dir": "f8dad0e0/h264"
+  },
+  {
+   "kind": "vp9",
+   "backend": "webcodecs",
+   "codec": "vp09.00.30.08",
+   "description": null,
+   "width": 852,
+   "height": 480,
+   "fps": 30.0,
+   "fpsFraction": "30/1",
+   "frames": 90,
+   "duration": 3.0,
+   "segmentDuration": 10.0,
+   "segments": [
+    {
+     "i": 0,
+     "start": 0.0,
+     "dur": 3.0,
+     "file": "seg_00000.bin",
+     "bytes": 591352,
+     "frames": 90
+    }
+   ],
+   "dir": "f8dad0e0/vp9"
+  },
+  {
+   "kind": "vp8",
+   "backend": "webcodecs",
+   "codec": "vp8",
+   "description": null,
+   "width": 852,
+   "height": 480,
+   "fps": 30.0,
+   "fpsFraction": "30/1",
+   "frames": 90,
+   "duration": 3.0,
+   "segmentDuration": 10.0,
+   "segments": [
+    {
+     "i": 0,
+     "start": 0.0,
+     "dur": 3.0,
+     "file": "seg_00000.bin",
+     "bytes": 726062,
+     "frames": 90
+    }
+   ],
+   "dir": "f8dad0e0/vp8"
+  },
+  {
+   "kind": "mpeg1",
+   "backend": "mpeg1",
+   "codec": "mpeg1video",
+   "description": null,
+   "width": 852,
+   "height": 480,
+   "fps": 30.0,
+   "fpsFraction": "30/1",
+   "frames": 90,
+   "duration": 3.0,
+   "segmentDuration": 10.0,
+   "segments": [
+    {
+     "i": 0,
+     "start": 0.0,
+     "dur": 3.0,
+     "file": "seg_00000.bin",
+     "bytes": 1262350,
+     "frames": 90
+    }
+   ],
+   "dir": "f8dad0e0/mpeg1"
+  }
+ ],
+ "thumb": "f8dad0e0/thumb.jpg",
+ "live": false,
+ "source": {
+  "path": "diag/480.mp4",
+  "mtime": 0,
+  "size": 0
+ },
+ "prepKey": "93a48516dbda",
+ "built": "2026-10-20T16:33:16"
+}

@@ -1,0 +1,4 @@
+{
+  "videoTracks": ["h264", "vp9", "mpeg1"],
+  "player": { "autoResyncMs": 500, "avOffsetMs": 0, "bufferSegments": 3 }
+}

@@ -1,0 +1,58 @@
+{
+ "format": 1,
+ "id": "360-baseline",
+ "title": "360-baseline",
+ "category": "diag",
+ "sort": "diag/360-baseline.mp4",
+ "duration": 3.0,
+ "v": "75a78e03",
+ "audio": [
+  {
+   "format": "opus",
+   "src": "75a78e03/audio.opus",
+   "mime": "audio/ogg; codecs=opus",
+   "duration": 3.025104
+  },
+  {
+   "format": "mp3",
+   "src": "75a78e03/audio.mp3",
+   "mime": "audio/mpeg",
+   "duration": 3.056327
+  }
+ ],
+ "tracks": [
+  {
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.42C01E",
+   "description": "AULAHv/hABlnQsAe2QCgL/lwEQAAAwABAAADADwPFi5IAQAFaMuDyyA=",
+   "width": 640,
+   "height": 360,
+   "fps": 30.0,
+   "fpsFraction": "30/1",
+   "frames": 90,
+   "duration": 3.0,
+   "segmentDuration": 10.0,
+   "segments": [
+    {
+     "i": 0,
+     "start": 0.0,
+     "dur": 3.0,
+     "file": "seg_00000.bin",
+     "bytes": 407803,
+     "frames": 90
+    }
+   ],
+   "dir": "75a78e03/h264"
+  }
+ ],
+ "thumb": "75a78e03/thumb.jpg",
+ "live": false,
+ "source": {
+  "path": "diag/360-baseline.mp4",
+  "mtime": 0,
+  "size": 0
+ },
+ "prepKey": "5a0982aefc13",
+ "built": "2026-10-20T16:33:24"
+}

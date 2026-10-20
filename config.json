@@ -1,0 +1,31 @@
+{
+  "videoTracks": ["h264", "mpeg1"],
+  "height": 480,
+  "maxFps": 30,
+  "keyframeSeconds": 1,
+  "segmentSeconds": 4,
+
+  "h264": { "profile": "main", "preset": "veryfast", "crf": 23 },
+  "vp9": { "crf": 34, "cpuUsed": 4 },
+  "vp8": { "crf": 10, "maxBitrate": "2M", "cpuUsed": 4 },
+  "mpeg1": { "quality": 5 },
+
+  "audioFormats": ["opus", "mp3"],
+  "opusBitrate": "64k",
+  "mp3Bitrate": "96k",
+  "normalizeAudio": true,
+
+  "thumbWidth": 320,
+
+  "player": {
+    "autoResyncMs": 500,
+    "avOffsetMs": 0,
+    "bufferSegments": 3
+  },
+
+  "hotspot": {
+    "ssid": "CanvasPlayer",
+    "password": "change-me-please",
+    "country": "US"
+  }
+}

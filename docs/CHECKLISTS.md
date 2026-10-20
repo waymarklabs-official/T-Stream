@@ -62,8 +62,10 @@ Built in from the start: it is what the toy uses on plain `http://`, or if WebCo
 
 ## Phase 5: offline with the hotspot
 
-- [ ] `hotspot-on` prints the Wi-Fi name and password
+- [ ] Over SSH from home Wi-Fi, `hotspot-on` prints the Wi-Fi name, password and the `ssh ...@10.42.0.1` line, warns, then your session drops
+- [ ] Join the hotspot from your laptop/phone and `ssh <user>@10.42.0.1` works; `tstream` shows **hotspot ON**
 - [ ] The toy joins that Wi-Fi (accept "no internet" / "stay connected" if asked)
 - [ ] `http://10.42.0.1/` shows the library and videos play
 - [ ] Reboot the Pi: after ~1 minute the hotspot is back and the toy reconnects
-- [ ] `hotspot-off` puts the Pi back on the home Wi-Fi
+- [ ] `hotspot-off` (over SSH via the hotspot) drops the session; a minute later `ssh <user>@<pi-name>.local` works from home Wi-Fi
+- [ ] Safety net: with the hotspot off, switch the router off and reboot the Pi; ~3-4 minutes later the hotspot appears. Switch the router back on and run `hotspot-off`

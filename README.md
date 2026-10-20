@@ -56,8 +56,26 @@ Add that address to the toy's allowed sites in its parental settings.
 Run `hotspot-on` on the Pi. The Pi becomes a Wi-Fi network, with the name and
 password printed and stored in `/srv/canvas-player/config.json`. Join it on the
 toy and open **`http://10.42.0.1/`**. The hotspot stays on across reboots
-until `hotspot-off`. Note: while the hotspot is on, the Pi's Wi-Fi is not on
-your home network (ethernet still is).
+until `hotspot-off`.
+
+**If the Pi has only Wi-Fi** (no ethernet cable), it is either on your home
+Wi-Fi or running its hotspot, never both:
+
+| Pi is... | Reach it by SSH | Internet on the Pi |
+|---|---|---|
+| on home Wi-Fi | `ssh <user>@<pi-name>.local` from your home network | yes |
+| running the hotspot | join the hotspot Wi-Fi, then `ssh <user>@10.42.0.1` | no |
+
+- Switching cuts your SSH session; both commands print what you need to
+  reconnect *before* switching, finish on their own, and log to
+  `/var/log/tstream-hotspot.log`.
+- **You can't get locked out:** if the hotspot can't start, the Pi goes back
+  to your home Wi-Fi. If `hotspot-off` can't join your home Wi-Fi, the hotspot
+  comes back. If the Pi joins no Wi-Fi within 3 minutes of booting (router off,
+  or you're away from home), it starts the hotspot by itself until the next
+  reboot, so the toy keeps working on trips too.
+- Updates need internet: `hotspot-off`, reconnect over home Wi-Fi,
+  `tstream update`, then `hotspot-on` again.
 
 ## Commands (on the Pi)
 
@@ -65,9 +83,9 @@ your home network (ethernet still is).
 |---|---|
 | `tstream` | Status (web server, hotspot, addresses, library) and help |
 | `prep` | Convert new or changed videos. `prep --force` rebuilds all (needed after changing encoding settings); `prep --prune` removes videos whose source file was deleted |
-| `hotspot-on` / `hotspot-off` | Pi Wi-Fi hotspot for the toy on / back to normal Wi-Fi. `hotspot-on "Name" "password"` sets new ones |
+| `hotspot-on` / `hotspot-off` | Pi Wi-Fi hotspot for the toy on / back to your home Wi-Fi (with automatic fallback either way). `hotspot-on "Name" "password"` sets new ones |
 | `read-diag` | Show the latest report from `diag.html` (`read-diag 3` for three) |
-| `tstream update` | Download the newest version and reinstall; keeps videos and settings |
+| `tstream update` | Download the newest version and reinstall; keeps videos and settings (needs internet: not in hotspot mode) |
 
 ## The player
 

@@ -5,6 +5,13 @@
 ROOT=${CANVAS_ROOT:-/srv/canvas-player}
 
 if [ "${1:-}" = update ]; then
+  if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx TStream-Hotspot; then
+    echo "The Pi is in hotspot mode, so it has no internet to download the update."
+    echo "1. hotspot-off      (then reconnect: ssh $(whoami)@$(hostname).local from your home Wi-Fi)"
+    echo "2. tstream update"
+    echo "3. hotspot-on       (if you want the hotspot again)"
+    exit 1
+  fi
   repo=$(cat "$ROOT/.repo" 2>/dev/null || true)
   if [ -z "$repo" ] || [ ! -d "$repo/.git" ]; then
     echo "Don't know where the T-Stream code is. Run: cd <your T-Stream folder> && git pull && bash install.sh"
@@ -45,6 +52,9 @@ except (OSError, ValueError, KeyError):
     print("  \033[31m%-14s\033[0m empty - put videos in %s/source and run: prep" % ("library", root))
 PYEOF
 if systemctl is-active --quiet canvas-prep.timer; then ok "auto-convert" "every 15 min (new files in $ROOT/source)"; fi
+if systemctl is-enabled --quiet tstream-wifi-fallback.service 2>/dev/null; then
+  ok "safety net" "no Wi-Fi 3 min after boot -> hotspot starts (log: /var/log/tstream-hotspot.log)"
+fi
 if [ -f "$ROOT/prep.log" ]; then echo "  last prep:     $(tail -n 1 "$ROOT/prep.log")"; fi
 cat <<EOF
 

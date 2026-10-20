@@ -69,6 +69,8 @@ for s in prep hotspot-on hotspot-off read-diag tstream; do
   install -m 0755 "$REPO/bin/$s.sh" "$ROOT/bin/$s.sh"
   ln -sf "$ROOT/bin/$s.sh" "/usr/local/bin/$s"
 done
+install -m 0644 "$REPO/bin/wifi-common.sh" "$ROOT/bin/wifi-common.sh"
+touch /var/log/tstream-hotspot.log
 
 if [ ! -f "$ROOT/config.json" ]; then
   cp "$REPO/config.json" "$ROOT/config.json"
@@ -163,6 +165,30 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now canvas-prep.timer >/dev/null 2>&1 || warn "could not enable the auto-convert timer"
+
+# -------------------------------------------------------- Wi-Fi safety net ---
+if command -v nmcli >/dev/null; then
+  step "Wi-Fi safety net: if the Pi joins no Wi-Fi within 3 minutes of booting, it starts its hotspot"
+  cat > /etc/systemd/system/tstream-wifi-fallback.service <<UNIT
+[Unit]
+Description=T-Stream: start the hotspot if no Wi-Fi is joined after boot
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+# simple, not oneshot: it waits in the background and never delays booting
+Type=simple
+Environment=CANVAS_ROOT=$ROOT
+ExecStart=$ROOT/bin/hotspot-on.sh --if-offline
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable tstream-wifi-fallback.service >/dev/null 2>&1 || warn "could not enable the Wi-Fi safety net"
+else
+  warn "NetworkManager is not installed: the hotspot commands will not work on this system."
+fi
 
 # ----------------------------------------------------------------- done ---
 step "Done"

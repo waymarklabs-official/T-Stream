@@ -11,11 +11,12 @@
 | `autoResyncMs` default 0 (off) | default **500** | Audio is the master, so video can only fall *behind*. If the decoder can't keep up, jumping to the next keyframe is the only fix, and nobody presses Resync during a cartoon. |
 | Decoder error → reset once → error card | reset once → **switch to the MPEG-1 track** mid-video → error card only if that fails too. Plus a **stall watchdog** (decoder with data but no pictures for 4 s of media time) | Unknown toy hardware decoders sometimes hang without an error. |
 | Seek decodes from the segment's first keyframe | decodes from the **last keyframe before the target** (keyframe every 1 s) | At most 1 s of hidden pre-roll instead of up to 4 s. |
-| `skip if output newer than source` | skip if **source size+mtime and encoding settings** are unchanged; atomic swap of finished items; lock against parallel runs; skips files still being copied | Changing `config.json` rebuilds affected items; a half-copied file is never published; a playing video is never half-replaced. |
+| `skip if output newer than source` | skip if **source size+mtime and encoding settings** are unchanged; atomic swap of finished items; each build in its **own `<stamp>/` folder**, previous build kept; lock against parallel runs; skips files still being copied | Changing `config.json` rebuilds affected items; a half-copied file is never published; a toy that is watching a video while it is re-encoded keeps reading its own build. |
 | WebP thumbnails | **JPEG** | No dependency on FFmpeg having libwebp; works on every browser. |
 | config.json served with the site | config stays in `/srv/canvas-player/`; only the `player` section is copied into `catalog.json` | The hotspot password isn't published on the web server. |
 | `prep.sh` wrapper | `prep` command **plus an auto-convert timer** (every 15 min, low priority) | Drop files in `source/` and they appear; no shell needed. |
 | — | Loudness normalization (`normalizeAudio`) | Kids' videos vary wildly in volume. |
+| `tls internal` (12 h certificates) | one-year certificates signed directly by Caddy's local root | The Pi has no battery clock; after a night unplugged in hotspot mode its time lags and short certificates would look expired to the toy. |
 | — | A/V **alignment fix** in prep: t=0 is put on the first video frame for both streams | FFmpeg otherwise shifts everything by the earliest stream's start (e.g. AAC priming at −21 ms), then the fps filter rounds video by up to a frame. Measured 19 ms error before, <1 ms after. |
 
 ## Playback engine (`site/player.js`)
@@ -23,7 +24,9 @@
 - **Clock:** `audio.currentTime` minus `avOffsetMs`. Between changes of
   `currentTime` the clock is extrapolated with `performance.now()` (capped at
   250 ms, so a stalled audio track also stalls the picture), and kept
-  monotonic.
+  monotonic. Extrapolation starts only once `currentTime` has moved after a
+  play/seek: Chrome holds it still while the sound output starts, which would
+  otherwise show the first frames ~45 ms early.
 - **Render loop** (`requestAnimationFrame`): drop queued frames that a newer
   frame has replaced, draw the newest frame whose time ≤ clock + 8 ms, close
   everything. At most 6 decoded frames are held (WebCodecs) or 1 (MPEG-1,
@@ -34,7 +37,9 @@
   segment is skipped (the picture freezes, the sound continues).
 - **Seek:** pause audio → set `audio.currentTime` → reset decoder → decode from
   the keyframe before the target, hiding earlier frames → once the target
-  frame is on screen and audio has seeked → resume.
+  frame is on screen and audio has seeked → resume. A newer seek supersedes
+  an older one (token); a segment that will not load is skipped, as in
+  normal playback.
 - **Resync:** the same video-only seek to (clock + 150 ms) while the sound keeps
   playing. **Auto-resync** jumps to the next keyframe when video is
   `autoResyncMs` behind.
@@ -56,18 +61,19 @@ payload: frame bytes in index order (H.264: AVCC length-prefixed; MPEG-1: one pi
 
 ```json
 { "format": 1, "id": "6435819bbe", "title": "…", "category": "Animals", "duration": 89.99, "v": "e7440b18",
-  "audio": [ { "format": "opus", "src": "audio.opus", "mime": "audio/ogg; codecs=opus" }, { "format": "mp3", … } ],
+  "audio": [ { "format": "opus", "src": "e7440b18/audio.opus", "mime": "audio/ogg; codecs=opus" }, { "format": "mp3", … } ],
   "tracks": [
     { "kind": "h264", "backend": "webcodecs", "codec": "avc1.4D401F", "description": "<base64 avcC>",
       "width": 852, "height": 480, "fps": 29.97, "fpsFraction": "30000/1001", "frames": 2697, "duration": 89.99,
-      "dir": "h264", "segmentDuration": 4,
+      "dir": "e7440b18/h264", "segmentDuration": 4,
       "segments": [ { "i": 0, "start": 0, "dur": 4.004, "file": "seg_00000.bin", "bytes": 402067, "frames": 120 } ] },
     { "kind": "mpeg1", "backend": "mpeg1", "codec": "mpeg1video", "description": null, … } ],
-  "thumb": "thumb.jpg", "live": false, "source": { "path": "Animals/x.mp4", "mtime": 0, "size": 0 }, "prepKey": "…" }
+  "thumb": "e7440b18/thumb.jpg", "live": false, "source": { "path": "Animals/x.mp4", "mtime": 0, "size": 0 }, "prepKey": "…" }
 ```
 
-`v` changes on every rebuild. All media URLs carry `?v=`, so the server can
-mark them cacheable forever. **catalog.json** lists categories → items (`id`,
+`v` is the build stamp: every rebuild writes into a new `media/<id>/<v>/`
+folder (the previous one is kept for players that still use it), so file
+URLs never change content and the server marks them cacheable forever. **catalog.json** lists categories → items (`id`,
 `title`, `duration`, `thumb`, `manifest`) plus the `player` settings.
 
 **Live (Phase 6, not built):** `cvs.Segmenter` already accepts frames one at
@@ -97,7 +103,9 @@ tools/make_test_media.py /tmp/lib/source            # synthetic videos: frame co
 python3 prep/prep.py --source /tmp/lib/source --media /tmp/lib/media --config tools/test-config.json
 tools/check_prep.py /tmp/lib/media                  # decodes every segment, checks frame numbers + beep timing
 ln -s /tmp/lib/media site/media                     # then serve site/ with server/Caddyfile.template
-node tools/e2e.js http://127.0.0.1/ --only=auto,mpeg1,crash,stall [--long=20]
+node tools/e2e.js http://127.0.0.1/ --only=auto,mpeg1,crash,stall,touch [--long=18]
+node tools/e2e-robust.js http://127.0.0.1/     # size change, missing segment, decoder dying while loading,
+                                               # lip-sync offset, Back while loading, racing seeks
 node tools/e2e-diag.js http://127.0.0.1/
 tools/make_diag_clips.py                            # regenerates site/diag/clips
 ```

@@ -18,6 +18,8 @@
 		output file @LOG@ {
 			roll_size 20MiB
 			roll_keep 3
+			# keep rolled files as plain .log so read-diag finds old reports
+			roll_uncompressed
 		}
 		format json
 	}
@@ -64,8 +66,16 @@ http:// {
 }
 
 https:// {
-	tls internal {
+	# One-year certificates signed directly by the 10-year local root: the Pi
+	# has no battery clock, so after a night unplugged (hotspot mode, no NTP)
+	# its time can be hours behind; short-lived certificates would then look
+	# expired to the toy.
+	tls {
 		on_demand
+		issuer internal {
+			lifetime 8760h
+			sign_with_root
+		}
 	}
 	import tstream
 }

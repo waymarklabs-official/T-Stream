@@ -63,6 +63,7 @@
     };
     xhr.onerror = function () { cb(new Error('network error for ' + url)); };
     xhr.ontimeout = function () { cb(new Error('timeout for ' + url)); };
+    xhr.onabort = function () { cb(new Error('aborted')); }; // so waiting promises settle
     xhr.send();
     return xhr;
   }
@@ -252,7 +253,12 @@
     this.capture = {
       resize: function (w, h) {
         // resizing clears the canvas; skip it when the size is unchanged
-        if (self.renderer.width !== w || self.renderer.height !== h) self.renderer.resize(w, h);
+        if (self.renderer.width !== w || self.renderer.height !== h) {
+          self.renderer.resize(w, h);
+          // jsmpeg's WebGL renderer would keep updating textures sized for
+          // the previous video (GL errors, frozen or garbled picture)
+          if (self.renderer.hasTextureData) self.renderer.hasTextureData = {};
+        }
       },
       render: function (y, cb, cr, clamped) { self.planes = [y, cb, cr, clamped]; }
     };
@@ -374,7 +380,7 @@
   };
 
   P._setState = function (s) {
-    if (this.state === s) return;
+    if (this.state === s || this.destroyed || this.state === 'error') return;
     this.state = s;
     if (this.opts.onState) this.opts.onState(s);
   };
@@ -423,9 +429,11 @@
 
   P.load = function (manifestUrl, startAt) {
     var self = this;
+    function alive() { if (self.destroyed) throw new Error('closed'); }
     this._setState('loading');
     this.base = manifestUrl.split('?')[0].replace(/[^\/]*$/, '');
     return getJSON(manifestUrl).then(function (m) {
+      alive();
       self.manifest = m;
       self.v = m.v ? '?v=' + encodeURIComponent(m.v) : '';
       self.duration = m.duration;
@@ -434,6 +442,7 @@
       self.audioInfo = a;
       return self._pickTrack(m.tracks || []);
     }).then(function (track) {
+      alive();
       self.track = track;
       return self._makeBackend(track);
     }).then(function (backend) {
@@ -442,9 +451,11 @@
       self._attachAudio();
       return self._waitAudioMetadata();
     }).then(function () {
+      alive();
       if (self.audio.duration && isFinite(self.audio.duration)) self.duration = Math.min(self.duration, self.audio.duration) || self.duration;
       return self._seekInternal(startAt || 0, false);
     }).then(function () {
+      alive();
       self._setState('paused');
       return self;
     }).catch(function (err) {
@@ -493,25 +504,34 @@
     this._dropSegments();
     this.track = track;
     this.feedSeg = -1;
-    return this._makeBackend(track).then(function (b) {
-      if (self.destroyed) { b.destroy(); return; }
+    // Seeks requested meanwhile (e.g. by load()) wait for this promise.
+    this._switchP = this._makeBackend(track).then(function (b) {
+      if (self.destroyed) { b.destroy(); throw new Error('closed'); }
       self._useBackend(b);
       self.switching = false;
       self.errorRetried = false;
       self.cleanSince = nowMs();
-      return self._videoSeek(Math.min(self.clockUs() / 1e6 + 0.3, self.duration), 'exact');
+    });
+    this._switchP.then(function () {
+      // during a seek decode at its target, otherwise just ahead of the sound
+      var t = self.seeking ? self.audio.currentTime : self.clockUs() / 1e6 + 0.3;
+      return self._videoSeek(Math.min(t, self.duration), 'exact');
     }).catch(function (e) {
       self.switching = false;
-      self._fail(e);
+      if (!self.destroyed) self._fail(e);
     });
+    return this._switchP;
   };
 
   P._dropSegments = function () {
-    for (var k in this.segCache) {
-      var e = this.segCache[k];
+    // Empty the cache first: abort() reports synchronously, and a request
+    // that still looked cached would be retried.
+    var cache = this.segCache;
+    this.segCache = {};
+    for (var k in cache) {
+      var e = cache[k];
       if (e.xhr && !e.data) try { e.xhr.abort(); } catch (x) { /* ignore */ }
     }
-    this.segCache = {};
   };
 
   P._attachAudio = function () {
@@ -533,11 +553,13 @@
   };
 
   P._waitAudioMetadata = function () {
-    var a = this.audio;
+    var a = this.audio, self = this;
     if (a.readyState >= 1) return Promise.resolve();
     return new Promise(function (resolve, reject) {
       var timer = setTimeout(function () { done(new Error('Audio did not load (timeout)')); }, 20000);
+      self._cancelWait = done; // destroy() ends the wait
       function done(err) {
+        self._cancelWait = null;
         clearTimeout(timer);
         a.removeEventListener('loadedmetadata', ok);
         a.removeEventListener('error', bad);
@@ -558,16 +580,21 @@
     var a = this.audio, t = a.currentTime;
     if (a.paused || a.seeking || this.seeking || this.state === 'buffering') {
       this.lastAudioT = NaN;
+      this.clockMoving = false;
       this.lastClock = t;
       return (t * 1e6) - this.avOffsetUs;
     }
     var n = nowMs();
     if (t !== this.lastAudioT) {
+      // After play() the audio clock stands still while the sound output
+      // starts up; only extrapolate once it has actually moved.
+      if (this.lastAudioT === this.lastAudioT) this.clockMoving = true; // (NaN !== NaN)
       this.lastAudioT = t;
       this.anchorT = t;
       this.anchorNow = n;
     }
-    var est = this.anchorT + Math.min((n - this.anchorNow) / 1000 * (a.playbackRate || 1), 0.25);
+    var est = this.anchorT;
+    if (this.clockMoving) est += Math.min((n - this.anchorNow) / 1000 * (a.playbackRate || 1), 0.25);
     if (est < this.lastClock && this.lastClock - est < 0.15) est = this.lastClock; // no small steps back
     this.lastClock = est;
     return (est * 1e6) - this.avOffsetUs;
@@ -736,7 +763,12 @@
   //   'exact':   decode from the keyframe before t, hide frames before t
   //   'nextKey': jump to the first keyframe at/after t (fast catch-up)
   P._videoSeek = function (t, mode) {
-    var self = this, epoch = ++this.epoch;
+    var self = this;
+    if (this.switching && this._switchP) {
+      return this._switchP.then(function () { return self._videoSeek(t, mode); });
+    }
+    if (!this.backend) return Promise.reject(new Error('no video decoder'));
+    var epoch = ++this.epoch;
     this._clearQueue();
     try { this.backend.reset(); } catch (e) { return Promise.reject(e); }
     this.feedSeg = -1;
@@ -772,6 +804,19 @@
         self.minTs = frames[target].ts;
       }
       self.pump();
+    }, function (err) {
+      if (epoch !== self.epoch || self.destroyed) return; // superseded meanwhile
+      // Same policy as pump(): skip a segment that will not load (picture
+      // freezes briefly, sound continues) rather than stopping the video.
+      if (++self.badSegments < 3 && si + 1 < self.track.segments.length) {
+        self.st.lastError = 'segment ' + si + ': ' + err.message;
+        self.feedSeg = si + 1;
+        self.feedIdx = 0;
+        self.minTs = 0;
+        self.pump();
+        return;
+      }
+      throw err;
     });
   };
 
@@ -786,8 +831,9 @@
     if (!a.paused) a.pause();
     try { a.currentTime = t; } catch (e) { /* metadata not ready; handled by load() */ }
     return this._videoSeek(t, 'exact').then(function () {
+      if (token !== self.seekToken || self.destroyed) return;
       return new Promise(function (resolve) {
-        self.pendingSeek = { token: token, minTs: self.minTs, resolve: resolve };
+        self.pendingSeek = { token: token, resolve: resolve };
         setTimeout(resolve, 6000); // never hang the UI
       });
     }).then(function () {
@@ -819,7 +865,9 @@
       q.shift().close();
       this.st.dropped++;
     }
-    if (q.length && q[0].ts <= c + DRAW_LEAD_US) {
+    // While seeking, the first decoded frame is the target: show it even if
+    // the lip-sync offset puts it slightly after the (paused) clock.
+    if (q.length && (q[0].ts <= c + DRAW_LEAD_US || (this.seeking && this.lastDrawnTs < 0))) {
       var h = q.shift();
       h.draw();
       h.close();
@@ -837,7 +885,7 @@
     }
 
     var ps = this.pendingSeek;
-    if (ps && this.lastDrawnTs >= ps.minTs && !this.audio.seeking) {
+    if (ps && this.lastDrawnTs >= 0 && this.lastDrawnTs >= this.minTs && !this.audio.seeking) {
       this.pendingSeek = null;
       ps.resolve();
     }
@@ -952,6 +1000,8 @@
     this.destroyed = true;
     caf(this.rafId);
     this.epoch++;
+    this.seekToken++;
+    if (this._cancelWait) this._cancelWait(new Error('closed'));
     this._clearQueue();
     this._dropSegments();
     if (this.backend) this.backend.destroy();

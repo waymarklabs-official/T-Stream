@@ -75,12 +75,16 @@ if [ ! -f "$ROOT/config.json" ]; then
 fi
 # Replace the placeholder hotspot password with a random, easy-to-type one.
 python3 - "$ROOT/config.json" <<'PYEOF'
-import json, random, sys
+import json, random, re, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
 hs = cfg.setdefault("hotspot", {})
-if hs.get("password", "change-me-please") == "change-me-please":
-    hs["password"] = "play-%04d-tv" % random.SystemRandom().randrange(10000)
+pw = hs.get("password", "change-me-please")
+# placeholder, or the weak 4-digit style of earlier versions
+if pw == "change-me-please" or re.match(r"^play-\d{4}-tv$", pw):
+    abc = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (l/1, o/0, i)
+    rnd = random.SystemRandom()
+    hs["password"] = "-".join("".join(rnd.choice(abc) for _ in range(4)) for _ in range(3))  # ~59 bits
     json.dump(cfg, open(p, "w"), indent=2)
 PYEOF
 
@@ -91,7 +95,7 @@ chown -R "$OWNER": "$ROOT/source" "$ROOT/site/media" "$ROOT/diag-reports" "$ROOT
 touch "$ROOT/prep.log" && chown "$OWNER": "$ROOT/prep.log"
 mkdir -p "$ROOT/site/diag" && touch "$ROOT/site/diag/last-report.json"
 # Rebuild the catalog so the player settings from config.json take effect.
-sudo -u "$OWNER" python3 "$ROOT/bin/prep.py" --root "$ROOT" --catalog-only >/dev/null || true
+sudo -u "$OWNER" python3 "$ROOT/bin/prep.py" --root "$ROOT" --catalog-only --no-wait || true
 
 # ---------------------------------------------------------- web server ---
 step "Configuring the Caddy web server"

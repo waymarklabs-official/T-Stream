@@ -12,24 +12,26 @@ ROOT=${CANVAS_ROOT:-/srv/canvas-player}
 LOG=${CANVAS_LOG:-/var/log/caddy/canvas-player.log}
 N=${1:-1}
 
-if [ ! -r "$LOG" ] && [ "$(id -u)" -ne 0 ]; then
+# Always as root: it writes the saved reports and site/diag/last-report.json.
+if [ "$(id -u)" -ne 0 ]; then
   exec sudo CANVAS_ROOT="$ROOT" CANVAS_LOG="$LOG" "$0" "$@"
 fi
 
 shopt -s nullglob
-files=( "${LOG%.log}"*.log "$LOG" )
+files=( "${LOG%.log}"*.log "${LOG%.log}"*.log.gz "$LOG" )
 if [ ! -e "$LOG" ]; then
   echo "No web server log at $LOG yet. Open http://<pi>/diag.html on the toy first."
   exit 1
 fi
 
 python3 - "$N" "$ROOT" "${files[@]}" <<'PYEOF'
-import base64, json, os, re, sys
+import base64, gzip, json, os, re, sys
 
 n, root, files = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
 seen = {}
 for fn in sorted(set(files), key=lambda f: os.path.getmtime(f)):
-    with open(fn, errors="replace") as f:
+    opener = gzip.open if fn.endswith(".gz") else open
+    with opener(fn, "rt", errors="replace") as f:
         for line in f:
             if "/diag/report?d=" not in line:
                 continue

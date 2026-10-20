@@ -11,7 +11,8 @@ CONF="$ROOT/config.json"
 CON=TStream-Hotspot
 IFACE=${IFACE:-wlan0}
 
-[ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" IFACE="$IFACE" "$0" "$@"
+# SSH_CONNECTION is passed on so the "this will cut your SSH session" warning works
+[ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" IFACE="$IFACE" SSH_CONNECTION="${SSH_CONNECTION:-}" "$0" "$@"
 
 if ! command -v nmcli >/dev/null; then
   echo "NetworkManager (nmcli) is not installed. Raspberry Pi OS Bookworm has it by default;"
@@ -51,7 +52,8 @@ if [ -n "${SSH_CONNECTION:-}" ]; then
   dev=$(ip route get "$client" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
   if [ "$dev" = "$IFACE" ]; then
     echo "WARNING: you are connected over $IFACE. Starting the hotspot will disconnect this SSH session."
-    echo "Reconnect afterwards by joining the '$SSID' Wi-Fi and running: ssh $(logname 2>/dev/null || echo pi)@10.42.0.1"
+    echo "Write this down. Wi-Fi name: $SSID   password: $PASS"
+    echo "Reconnect afterwards by joining that Wi-Fi and running: ssh $(logname 2>/dev/null || echo pi)@10.42.0.1"
     echo "Starting in 10 seconds (Ctrl-C to cancel)..."
     sleep 10
   fi

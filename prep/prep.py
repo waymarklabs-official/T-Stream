@@ -548,9 +548,14 @@ def build_catalog(media_dir, cfg):
     return catalog
 
 
+class Busy(Exception):
+    pass
+
+
 class Lock:
-    def __init__(self, path):
+    def __init__(self, path, wait=True):
         self.path = path
+        self.wait = wait
         self.f = None
 
     def __enter__(self):
@@ -562,6 +567,9 @@ class Lock:
         try:
             fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            if not self.wait:
+                self.f.close()
+                raise Busy()
             log("another prep is running; waiting for it to finish...")
             fcntl.flock(self.f, fcntl.LOCK_EX)
         return self
@@ -581,6 +589,7 @@ def main(argv=None):
     ap.add_argument("--only", help="only (re)build items whose relative path matches this glob")
     ap.add_argument("--prune", action="store_true", help="delete media whose source file no longer exists")
     ap.add_argument("--catalog-only", action="store_true", help="only rebuild catalog.json")
+    ap.add_argument("--no-wait", action="store_true", help="exit instead of waiting when another prep is running")
     ap.add_argument("--settle", type=int, default=60,
                     help="skip files modified in the last N seconds (still copying). Default 60")
     args = ap.parse_args(argv)
@@ -598,85 +607,93 @@ def main(argv=None):
     key = prep_key(cfg)
     os.makedirs(media_dir, exist_ok=True)
 
-    with Lock(os.path.join(media_dir, ".prep.lock")):
-        if args.catalog_only:
-            cat = build_catalog(media_dir, cfg)
-            log("catalog: %d categories, %d items" % (len(cat["categories"]),
-                                                      sum(len(c["items"]) for c in cat["categories"])))
-            return 0
+    try:
+        with Lock(os.path.join(media_dir, ".prep.lock"), wait=not args.no_wait):
+            return run_prep(args, cfg, key, source_dir, media_dir, config_path)
+    except Busy:
+        log("a conversion is running right now; the library list updates when it finishes")
+        return 0
 
-        check_tools()
-        log("source: %s\nmedia:  %s\nconfig: %s (key %s)" % (source_dir, media_dir, config_path, key))
-        if not os.path.isdir(source_dir):
-            raise SystemExit("source folder %s does not exist" % source_dir)
-        for d in os.listdir(media_dir):  # leftovers from an interrupted run
-            if d.startswith(".tmp-") or d.startswith(".old-"):
-                shutil.rmtree(os.path.join(media_dir, d), ignore_errors=True)
 
-        sources = scan_sources(source_dir)
-        built = skipped = failed = waiting = 0
-        failures = []
-        now = time.time()
-        for i, (path, rel, category) in enumerate(sources, 1):
-            if args.only and not fnmatch.fnmatch(rel.replace(os.sep, "/"), args.only):
-                continue
-            try:
-                st = os.stat(path)  # can vanish mid-run, or be a dangling link
-                iid = item_id(rel)
-            except (OSError, ValueError) as e:
-                failed += 1
-                failures.append(readable(rel))
-                log("[%d/%d] %s: FAILED: %s" % (i, len(sources), readable(rel), e))
-                continue
-            mtime, size = int(st.st_mtime), st.st_size
-            out_dir = os.path.join(media_dir, iid)
-            m = read_manifest(os.path.join(out_dir, "manifest.json"))
-            fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime
-                     and m.get("source", {}).get("size") == size)
-            if fresh and not (args.force or args.only):
-                skipped += 1
-                continue
-            if now - st.st_mtime < args.settle:
-                log("[%d/%d] %s: modified %ds ago, maybe still copying - will pick it up next run"
-                    % (i, len(sources), readable(rel), now - st.st_mtime))
-                waiting += 1
-                continue
-            log("[%d/%d] %s  (%s, id %s)" % (i, len(sources), readable(rel), readable(category), iid))
-            t0 = time.time()
-            try:
-                build_item(path, rel, category, out_dir, cfg, key, mtime, size)
-                built += 1
-                log("    done in %.0fs" % (time.time() - t0))
-                build_catalog(media_dir, cfg)  # new items appear as soon as they are ready
-            except KeyboardInterrupt:
-                log("interrupted")
-                build_catalog(media_dir, cfg)
-                return 130
-            except Exception as e:  # keep going with the rest of the library
-                failed += 1
-                failures.append(readable(rel))
-                log("    FAILED: %s" % e)
-
-        if args.prune:
-            if not sources:
-                log("prune: source folder is empty - refusing to prune everything")
-            else:
-                wanted = {item_id(rel) for _, rel, _ in sources}
-                for d in sorted(os.listdir(media_dir)):
-                    if d.startswith(".") or d in wanted or not os.path.isdir(os.path.join(media_dir, d)):
-                        continue
-                    m = read_manifest(os.path.join(media_dir, d, "manifest.json"))
-                    if m is not None:
-                        log("prune: removing %s (%s)" % (d, m.get("source", {}).get("path")))
-                        shutil.rmtree(os.path.join(media_dir, d))
-
+def run_prep(args, cfg, key, source_dir, media_dir, config_path):
+    if args.catalog_only:
         cat = build_catalog(media_dir, cfg)
-        total = sum(len(c["items"]) for c in cat["categories"])
-        log("built %d, unchanged %d, failed %d, waiting %d. Library: %d items in %d categories."
-            % (built, skipped, failed, waiting, total, len(cat["categories"])))
-        for f in failures:
-            log("  failed: %s" % f)
-        return 1 if failed else 0
+        log("catalog: %d categories, %d items" % (len(cat["categories"]),
+                                                  sum(len(c["items"]) for c in cat["categories"])))
+        return 0
+
+    check_tools()
+    log("source: %s\nmedia:  %s\nconfig: %s (key %s)" % (source_dir, media_dir, config_path, key))
+    if not os.path.isdir(source_dir):
+        raise SystemExit("source folder %s does not exist" % source_dir)
+    for d in os.listdir(media_dir):  # leftovers from an interrupted run
+        if d.startswith(".tmp-") or d.startswith(".old-"):
+            shutil.rmtree(os.path.join(media_dir, d), ignore_errors=True)
+
+    sources = scan_sources(source_dir)
+    built = skipped = failed = waiting = 0
+    failures = []
+    now = time.time()
+    for i, (path, rel, category) in enumerate(sources, 1):
+        if args.only and not fnmatch.fnmatch(rel.replace(os.sep, "/"), args.only):
+            continue
+        try:
+            st = os.stat(path)  # can vanish mid-run, or be a dangling link
+            iid = item_id(rel)
+        except (OSError, ValueError) as e:
+            failed += 1
+            failures.append(readable(rel))
+            log("[%d/%d] %s: FAILED: %s" % (i, len(sources), readable(rel), e))
+            continue
+        mtime, size = int(st.st_mtime), st.st_size
+        out_dir = os.path.join(media_dir, iid)
+        m = read_manifest(os.path.join(out_dir, "manifest.json"))
+        fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime
+                 and m.get("source", {}).get("size") == size)
+        if fresh and not (args.force or args.only):
+            skipped += 1
+            continue
+        if now - st.st_mtime < args.settle:
+            log("[%d/%d] %s: modified %ds ago, maybe still copying - will pick it up next run"
+                % (i, len(sources), readable(rel), now - st.st_mtime))
+            waiting += 1
+            continue
+        log("[%d/%d] %s  (%s, id %s)" % (i, len(sources), readable(rel), readable(category), iid))
+        t0 = time.time()
+        try:
+            build_item(path, rel, category, out_dir, cfg, key, mtime, size)
+            built += 1
+            log("    done in %.0fs" % (time.time() - t0))
+            build_catalog(media_dir, cfg)  # new items appear as soon as they are ready
+        except KeyboardInterrupt:
+            log("interrupted")
+            build_catalog(media_dir, cfg)
+            return 130
+        except Exception as e:  # keep going with the rest of the library
+            failed += 1
+            failures.append(readable(rel))
+            log("    FAILED: %s" % e)
+
+    if args.prune:
+        if not sources:
+            log("prune: source folder is empty - refusing to prune everything")
+        else:
+            wanted = {item_id(rel) for _, rel, _ in sources}
+            for d in sorted(os.listdir(media_dir)):
+                if d.startswith(".") or d in wanted or not os.path.isdir(os.path.join(media_dir, d)):
+                    continue
+                m = read_manifest(os.path.join(media_dir, d, "manifest.json"))
+                if m is not None:
+                    log("prune: removing %s (%s)" % (d, m.get("source", {}).get("path")))
+                    shutil.rmtree(os.path.join(media_dir, d))
+
+    cat = build_catalog(media_dir, cfg)
+    total = sum(len(c["items"]) for c in cat["categories"])
+    log("built %d, unchanged %d, failed %d, waiting %d. Library: %d items in %d categories."
+        % (built, skipped, failed, waiting, total, len(cat["categories"])))
+    for f in failures:
+        log("  failed: %s" % f)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

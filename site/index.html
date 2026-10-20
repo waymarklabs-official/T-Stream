@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#16133a">
+<title>T-Stream</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div id="home" class="screen home">
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span>T-Stream</div>
+    <select id="category" class="category" aria-label="Category"></select>
+  </header>
+  <main id="grid" class="grid" aria-live="polite"></main>
+  <div id="message" class="message" hidden></div>
+</div>
+
+<div id="player" class="screen player" hidden>
+  <img id="poster" class="poster" alt="" draggable="false">
+  <div id="stage" class="stage"></div>
+  <div id="spinner" class="spinner" hidden></div>
+
+  <div id="controls" class="controls">
+    <div class="ctl-top">
+      <button id="back" class="btn back" aria-label="Back">
+        <svg viewBox="0 0 24 24"><path d="M15 4 7 12l8 8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div id="title" class="title"></div>
+    </div>
+
+    <button id="bigplay" class="bigplay" aria-label="Play">
+      <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+      <svg class="i-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
+    </button>
+
+    <div class="ctl-bottom">
+      <div class="scrub">
+        <span id="elapsed" class="time">0:00</span>
+        <input id="scrub" type="range" min="0" max="1" step="0.1" value="0" aria-label="Position">
+        <span id="total" class="time">0:00</span>
+      </div>
+      <div class="buttons">
+        <button id="back10" class="btn" aria-label="Back 10 seconds">&minus;10s</button>
+        <button id="playpause" class="btn round" aria-label="Play or pause">
+          <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+          <svg class="i-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
+        </button>
+        <button id="fwd10" class="btn" aria-label="Forward 10 seconds">+10s</button>
+        <button id="resync" class="btn subtle" aria-label="Resync picture and sound">Resync</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <div id="errorcard" class="errorcard" hidden>
+    <div class="face"><span></span><span></span></div>
+    <p class="big">Couldn't play this one</p>
+    <p id="errordetail" class="detail"></p>
+    <button id="errorback" class="btn">Back</button>
+  </div>
+
+  <div id="corner" class="corner"></div>
+  <div id="debug" class="debug" hidden>
+    <pre id="debugtext"></pre>
+    <div class="debugbtns">
+      <button id="avminus" class="btn small">Video &minus;20ms</button>
+      <button id="avplus" class="btn small">Video +20ms</button>
+      <button id="debugclose" class="btn small">Close</button>
+    </div>
+  </div>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+
+<div id="oldbrowser" class="message" hidden>
+  This browser is too old for the player.<br>
+  Please open <a href="diag.html">diag.html</a> on this device and run the tests.
+</div>
+
+<script>
+// ES5 feature check: if this fails, the player scripts would not work either.
+(function () {
+  var ok = typeof Promise === 'function' && typeof XMLHttpRequest === 'function' &&
+    typeof DataView === 'function' && typeof Uint8Array === 'function' &&
+    !!window.requestAnimationFrame && !!document.addEventListener && typeof JSON === 'object';
+  if (!ok) {
+    document.getElementById('home').hidden = true;
+    document.getElementById('oldbrowser').hidden = false;
+    window.TSTREAM_TOO_OLD = true;
+  }
+})();
+</script>
+<script src="player.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

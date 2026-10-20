@@ -1,0 +1,124 @@
+{
+ "clips": [
+  {
+   "clip": "480",
+   "manifest": "480/manifest.json",
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.4D401F",
+   "profile": "main",
+   "width": 852,
+   "height": 480,
+   "frames": 90,
+   "kbps": 1747
+  },
+  {
+   "clip": "480",
+   "manifest": "480/manifest.json",
+   "kind": "vp9",
+   "backend": "webcodecs",
+   "codec": "vp09.00.30.08",
+   "profile": null,
+   "width": 852,
+   "height": 480,
+   "frames": 90,
+   "kbps": 1577
+  },
+  {
+   "clip": "480",
+   "manifest": "480/manifest.json",
+   "kind": "vp8",
+   "backend": "webcodecs",
+   "codec": "vp8",
+   "profile": null,
+   "width": 852,
+   "height": 480,
+   "frames": 90,
+   "kbps": 1936
+  },
+  {
+   "clip": "480",
+   "manifest": "480/manifest.json",
+   "kind": "mpeg1",
+   "backend": "mpeg1",
+   "codec": "mpeg1video",
+   "profile": null,
+   "width": 852,
+   "height": 480,
+   "frames": 90,
+   "kbps": 3366
+  },
+  {
+   "clip": "480-baseline",
+   "manifest": "480-baseline/manifest.json",
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.42C01F",
+   "profile": "baseline",
+   "width": 852,
+   "height": 480,
+   "frames": 90,
+   "kbps": 1880
+  },
+  {
+   "clip": "360",
+   "manifest": "360/manifest.json",
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.4D401E",
+   "profile": "main",
+   "width": 640,
+   "height": 360,
+   "frames": 90,
+   "kbps": 1006
+  },
+  {
+   "clip": "360",
+   "manifest": "360/manifest.json",
+   "kind": "vp9",
+   "backend": "webcodecs",
+   "codec": "vp09.00.21.08",
+   "profile": null,
+   "width": 640,
+   "height": 360,
+   "frames": 90,
+   "kbps": 846
+  },
+  {
+   "clip": "360",
+   "manifest": "360/manifest.json",
+   "kind": "vp8",
+   "backend": "webcodecs",
+   "codec": "vp8",
+   "profile": null,
+   "width": 640,
+   "height": 360,
+   "frames": 90,
+   "kbps": 1933
+  },
+  {
+   "clip": "360",
+   "manifest": "360/manifest.json",
+   "kind": "mpeg1",
+   "backend": "mpeg1",
+   "codec": "mpeg1video",
+   "profile": null,
+   "width": 640,
+   "height": 360,
+   "frames": 90,
+   "kbps": 1881
+  },
+  {
+   "clip": "360-baseline",
+   "manifest": "360-baseline/manifest.json",
+   "kind": "h264",
+   "backend": "webcodecs",
+   "codec": "avc1.42C01E",
+   "profile": "baseline",
+   "width": 640,
+   "height": 360,
+   "frames": 90,
+   "kbps": 1087
+  }
+ ]
+}

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T-Stream diagnostics</title>
+<style>
+  body { margin: 0; padding: 16px; background: #16133a; color: #fff; font: 18px/1.4 system-ui, Roboto, Arial, sans-serif; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 21px; margin: 26px 0 8px; color: #ffcc33; }
+  .sub { color: #b9b4ee; margin: 0 0 12px; }
+  table { border-collapse: collapse; width: 100%; max-width: 980px; }
+  td { padding: 6px 8px; border-bottom: 1px solid #2d2870; vertical-align: top; word-break: break-word; }
+  td:first-child { width: 40%; color: #d8d4ff; }
+  .ok { color: #5ee6a8; font-weight: 700; }
+  .bad { color: #ff6b6b; font-weight: 700; }
+  .warn { color: #ffcc33; font-weight: 700; }
+  .btn { display: inline-block; margin: 12px 12px 0 0; padding: 16px 26px; font-size: 20px; font-weight: 800; color: #222;
+         background: #ffcc33; border: 0; border-radius: 30px; text-decoration: none; }
+  .btn.alt { background: #2d2870; color: #fff; }
+  .btn[disabled] { opacity: .5; }
+  #status { margin-top: 14px; font-size: 20px; font-weight: 700; }
+  #stage { position: relative; width: 320px; height: 180px; margin-top: 12px; background: #000; }
+  #stage canvas { width: 100%; height: 100%; object-fit: contain; }
+  #summary li { margin: 6px 0; }
+  textarea { width: 100%; max-width: 980px; height: 160px; background: #0d0b24; color: #b9b4ee; font: 12px monospace; }
+</style>
+</head>
+<body>
+<h1>T-Stream diagnostics</h1>
+<p class="sub">Run this on the toy. It checks what the browser can do and sends the results to the Pi
+  (read them there with <b>read-diag</b>).</p>
+
+<div>
+  <button id="run" class="btn">Run playback tests</button>
+  <a class="btn alt" href="index.html">Open the player</a>
+  <a id="otherproto" class="btn alt" href="#" hidden></a>
+</div>
+<div id="status">Checking the browser...</div>
+<div id="stage"></div>
+
+<h2>Summary</h2>
+<ul id="summary"><li>Tap <b>Run playback tests</b> for the full picture.</li></ul>
+
+<h2>Device and browser</h2>
+<table id="env"></table>
+
+<h2>Features</h2>
+<table id="features"></table>
+
+<h2>Video codecs (WebCodecs)</h2>
+<table id="codecs"></table>
+
+<h2>Audio formats</h2>
+<table id="audio"></table>
+
+<h2>Playback tests</h2>
+<table id="tests"><tr><td>Not run yet</td><td></td></tr></table>
+
+<h2>Raw report</h2>
+<textarea id="raw" readonly></textarea>
+
+<script src="player.js"></script>
+<script src="diag.js"></script>
+</body>
+</html>

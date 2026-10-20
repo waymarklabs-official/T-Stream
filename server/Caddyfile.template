@@ -1,0 +1,77 @@
+# T-Stream / canvas player - written by install.sh. Re-run install.sh to regenerate.
+# Serves @ROOT@/site over plain HTTP (:80) and HTTPS (:443) with a local
+# certificate authority, so the toy can use either.
+{
+	# keep plain http:// working; never redirect it to https://
+	auto_https disable_redirects
+	skip_install_trust
+	# certificates for whatever IP/name the toy uses (10.42.0.1, LAN IP, ...)
+	on_demand_tls {
+		ask http://127.0.0.1:2080/tls-ok
+	}
+}
+
+(tstream) {
+	root * @ROOT@/site
+
+	log {
+		output file @LOG@ {
+			roll_size 20MiB
+			roll_keep 3
+		}
+		format json
+	}
+
+	# Phase 0: diag.html sends its report here; the access log keeps it.
+	@diag path /diag/report
+	respond @diag 204
+
+	# Media URLs carry ?v=<build stamp>, so they can be cached forever.
+	@immutable {
+		path /media/*
+		not path *.json
+	}
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	@revalidate path / *.html *.js *.css *.json /diag/*
+	header @revalidate Cache-Control "no-cache"
+
+	# Explicit types: segments are opaque bytes, never a video type.
+	@bin path *.bin
+	header @bin Content-Type application/octet-stream
+	@opus path *.opus
+	header @opus Content-Type audio/ogg
+	@mp3 path *.mp3
+	header @mp3 Content-Type audio/mpeg
+	@crt path /ca.crt
+	header @crt Content-Type application/x-x509-ca-cert
+
+	header X-Content-Type-Options nosniff
+
+	encode {
+		gzip
+		match {
+			header Content-Type text/*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+		}
+	}
+
+	file_server
+}
+
+http:// {
+	import tstream
+}
+
+https:// {
+	tls internal {
+		on_demand
+	}
+	import tstream
+}
+
+# Answers Caddy's own "may I issue a certificate for this name?" question.
+http://127.0.0.1:2080 {
+	bind 127.0.0.1
+	respond /tls-ok 200
+}

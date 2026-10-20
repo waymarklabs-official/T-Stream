@@ -5,17 +5,17 @@
  "category": "diag",
  "sort": "diag/480-baseline.mp4",
  "duration": 3.0,
- "v": "8a7ec2f5",
+ "v": "1ae30282",
  "audio": [
   {
    "format": "opus",
-   "src": "audio.opus",
+   "src": "1ae30282/audio.opus",
    "mime": "audio/ogg; codecs=opus",
    "duration": 3.025104
   },
   {
    "format": "mp3",
-   "src": "audio.mp3",
+   "src": "1ae30282/audio.mp3",
    "mime": "audio/mpeg",
    "duration": 3.056327
   }
@@ -43,10 +43,10 @@
      "frames": 90
     }
    ],
-   "dir": "h264"
+   "dir": "1ae30282/h264"
   }
  ],
- "thumb": "thumb.jpg",
+ "thumb": "1ae30282/thumb.jpg",
  "live": false,
  "source": {
   "path": "diag/480-baseline.mp4",
@@ -54,5 +54,5 @@
   "size": 0
  },
  "prepKey": "ae403b9b6ac1",
- "built": "2026-10-20T03:28:14"
+ "built": "2026-10-20T16:33:18"
 }

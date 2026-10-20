@@ -5,17 +5,17 @@
  "category": "diag",
  "sort": "diag/480.mp4",
  "duration": 3.0,
- "v": "6ec30ee2",
+ "v": "f8dad0e0",
  "audio": [
   {
    "format": "opus",
-   "src": "audio.opus",
+   "src": "f8dad0e0/audio.opus",
    "mime": "audio/ogg; codecs=opus",
    "duration": 3.025104
   },
   {
    "format": "mp3",
-   "src": "audio.mp3",
+   "src": "f8dad0e0/audio.mp3",
    "mime": "audio/mpeg",
    "duration": 3.056327
   }
@@ -43,7 +43,7 @@
      "frames": 90
     }
    ],
-   "dir": "h264"
+   "dir": "f8dad0e0/h264"
   },
   {
    "kind": "vp9",
@@ -67,7 +67,7 @@
      "frames": 90
     }
    ],
-   "dir": "vp9"
+   "dir": "f8dad0e0/vp9"
   },
   {
    "kind": "vp8",
@@ -91,7 +91,7 @@
      "frames": 90
     }
    ],
-   "dir": "vp8"
+   "dir": "f8dad0e0/vp8"
   },
   {
    "kind": "mpeg1",
@@ -115,10 +115,10 @@
      "frames": 90
     }
    ],
-   "dir": "mpeg1"
+   "dir": "f8dad0e0/mpeg1"
   }
  ],
- "thumb": "thumb.jpg",
+ "thumb": "f8dad0e0/thumb.jpg",
  "live": false,
  "source": {
   "path": "diag/480.mp4",
@@ -126,5 +126,5 @@
   "size": 0
  },
  "prepKey": "93a48516dbda",
- "built": "2026-10-20T03:28:13"
+ "built": "2026-10-20T16:33:16"
 }

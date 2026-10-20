@@ -36,6 +36,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from fractions import Fraction
 
@@ -134,7 +136,13 @@ def clean_title(stem):
 
 
 def item_id(rel_path):
-    return hashlib.sha1(rel_path.replace(os.sep, "/").encode("utf-8")).hexdigest()[:10]
+    # surrogateescape: names that are not valid UTF-8 (old zips, USB sticks)
+    return hashlib.sha1(rel_path.replace(os.sep, "/").encode("utf-8", "surrogateescape")).hexdigest()[:10]
+
+
+def readable(name):
+    """A file name made safe for titles and logs (invalid bytes become U+FFFD)."""
+    return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 def parse_rate(s):
@@ -171,7 +179,9 @@ def choose_fps(src, max_fps):
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, **kw)
+    # ffmpeg/ffprobe print UTF-8 whatever the OS code page is (Windows)
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          encoding="utf-8", errors="replace", **kw)
 
 
 def probe(path):
@@ -179,6 +189,41 @@ def probe(path):
     if p.returncode != 0:
         raise RuntimeError("ffprobe failed: %s" % p.stderr.strip()[-500:])
     return json.loads(p.stdout)
+
+
+def source_duration(info, path):
+    """Duration in seconds, also for files without a duration header
+    (streamed WebM, some TS recordings)."""
+    def pos(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    d = pos(info.get("format", {}).get("duration"))
+    if d:
+        return d
+    found = []
+    for st in info.get("streams", []):
+        found.append(pos(st.get("duration")))
+        tags = st.get("tags") or {}
+        m = re.match(r"(\d+):(\d+):([\d.]+)", tags.get("DURATION") or tags.get("duration") or "")
+        if m:
+            found.append(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)))
+    found = [x for x in found if x]
+    if found:
+        return max(found)
+    try:  # last resort: read packet timestamps (no decoding)
+        import av
+        end = 0.0
+        with av.open(path) as c:
+            for pkt in c.demux():
+                if pkt.pts is not None and pkt.time_base is not None:
+                    end = max(end, float((pkt.pts + (pkt.duration or 0)) * pkt.time_base))
+        return (end - (pos(info.get("format", {}).get("start_time")) or 0.0)) or None
+    except Exception:
+        return None
 
 
 def media_duration(path):
@@ -221,7 +266,7 @@ def video_codec_args(kind, cfg, gop):
     raise ValueError(kind)
 
 
-def build_ffmpeg_cmd(src, info, cfg, fps, tmp):
+def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
     """One ffmpeg run decodes the source once and writes every video track
     plus every audio format, all aligned to start at t=0."""
     streams = info.get("streams", [])
@@ -231,11 +276,6 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp):
     if not vstreams:
         raise RuntimeError("no video stream")
     vi = vstreams[0]["index"]
-    duration = None
-    try:
-        duration = float(info["format"]["duration"])
-    except (KeyError, ValueError):
-        pass
 
     # ffmpeg shifts every stream by the file's earliest start time, which can
     # be an audio stream starting early (AAC priming shows up as -21 ms). The
@@ -256,7 +296,9 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp):
     else:
         # Silent track: the audio element is the player's clock, so every
         # item needs one.
-        cmd += ["-f", "lavfi", "-t", "%.3f" % (duration or 1), "-i", "anullsrc=r=48000:cl=stereo"]
+        if not duration:
+            raise RuntimeError("cannot tell how long this video is")
+        cmd += ["-f", "lavfi", "-t", "%.3f" % duration, "-i", "anullsrc=r=48000:cl=stereo"]
         amap = "1:a"
 
     h = int(cfg["height"])
@@ -284,9 +326,15 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp):
     for fmt in cfg["audioFormats"]:
         rate = 48000 if fmt == "opus" else 44100
         af = ["asetpts=%s" % shift if astreams else "anull", "aresample=async=1:first_pts=0"]
-        if cfg["normalizeAudio"]:
-            af.append("loudnorm=I=-18:TP=-2:LRA=11")
-        if duration:
+        if cfg["normalizeAudio"] and astreams:
+            if duration:
+                # loudnorm needs 3 s of input (shorter silence turns into NaN,
+                # which crashes the MP3 encoder): pad first, trim back after.
+                af += ["apad=whole_dur=%.3f" % max(duration, 3.5), "loudnorm=I=-18:TP=-2:LRA=11",
+                       "atrim=end=%.3f" % duration]
+            else:
+                af.append("loudnorm=I=-18:TP=-2:LRA=11")
+        elif duration:
             af.append("apad=whole_dur=%.3f" % duration)
         af.append("aresample=%d" % rate)
         path = os.path.join(tmp, AUDIO_FORMATS[fmt]["file"])
@@ -298,14 +346,32 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp):
             cmd += ["-c:a", "libmp3lame", "-b:a", cfg["mp3Bitrate"], "-f", "mp3"]
         cmd += ["-max_muxing_queue_size", "4096", path]
         outputs[fmt] = path
-    return cmd, outputs, duration
+    return cmd, outputs
+
+
+STALL_SECONDS = 900
 
 
 def run_ffmpeg_with_progress(cmd, duration, label):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    # stderr goes to a file: a damaged source can print megabytes of decode
+    # errors, which would fill a pipe nobody reads and hang ffmpeg forever.
+    errf = tempfile.TemporaryFile()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, encoding="utf-8", errors="replace")
     last = -1
     start = time.time()
+    alive = [time.time(), False]
+
+    def watchdog():  # kill ffmpeg if it stops making progress (stuck input)
+        while p.poll() is None:
+            if time.time() - alive[0] > STALL_SECONDS:
+                alive[1] = True
+                p.kill()
+                return
+            time.sleep(5)
+    threading.Thread(target=watchdog, daemon=True).start()
+
     for line in p.stdout:
+        alive[0] = time.time()
         if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
             try:
                 t = int(line.split("=", 1)[1]) / 1e6
@@ -317,8 +383,12 @@ def run_ffmpeg_with_progress(cmd, duration, label):
                     last = pct
                     speed = t / max(0.001, time.time() - start)
                     log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, speed))
-    err = p.stderr.read()
     p.wait()
+    errf.seek(0)
+    err = errf.read().decode("utf-8", "replace")
+    errf.close()
+    if alive[1]:
+        raise RuntimeError("ffmpeg made no progress for %d minutes and was stopped" % (STALL_SECONDS // 60))
     if p.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n%s" % err.strip()[-2000:])
 
@@ -336,11 +406,20 @@ def make_thumb(video_path, duration, width, out_path):
 
 
 def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
+    """Encodes one video into out_dir/<stamp>/... plus out_dir/manifest.json.
+
+    Every build gets its own <stamp> folder, so a toy that is still playing
+    the previous build keeps reading the previous files (same URLs would
+    otherwise mix old and new encodings). The previous build is kept next to
+    the new one; older ones are deleted.
+    """
     iid = os.path.basename(out_dir)
     media_dir = os.path.dirname(out_dir)
     tmp = os.path.join(media_dir, ".tmp-" + iid)
+    stamp = hashlib.sha1(("%s|%s|%s|%s" % (key, mtime, size, time.time())).encode()).hexdigest()[:8]
+    vdir = os.path.join(tmp, stamp)
     shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
+    os.makedirs(vdir)
     try:
         info = probe(src)
         vstreams = [s for s in info.get("streams", []) if s.get("codec_type") == "video"
@@ -349,8 +428,9 @@ def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
             raise RuntimeError("no video stream (audio-only files are not supported)")
         src_fps = parse_rate(vstreams[0].get("avg_frame_rate")) or parse_rate(vstreams[0].get("r_frame_rate"))
         fps = choose_fps(src_fps, cfg["maxFps"])
+        duration = source_duration(info, src)
 
-        cmd, outputs, duration = build_ffmpeg_cmd(src, info, cfg, fps, tmp)
+        cmd, outputs = build_ffmpeg_cmd(src, info, cfg, fps, vdir, duration)
         log("    encoding %s @ %s fps -> %s + %s" % (
             "x".join(str(x) for x in (vstreams[0].get("width"), vstreams[0].get("height"))),
             "%.3f" % float(fps), "+".join(cfg["videoTracks"]), "+".join(cfg["audioFormats"])))
@@ -358,44 +438,47 @@ def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
 
         tracks = []
         for kind in cfg["videoTracks"]:
-            track = cvs.packetize(outputs[kind], os.path.join(tmp, kind), kind, fps,
+            track = cvs.packetize(outputs[kind], os.path.join(vdir, kind), kind, fps,
                                   float(cfg["segmentSeconds"]), log=log)
-            track["dir"] = kind
+            track["dir"] = "%s/%s" % (stamp, kind)
             tracks.append(track)
 
         audio = []
         for fmt in cfg["audioFormats"]:
             a = AUDIO_FORMATS[fmt]
-            audio.append({"format": fmt, "src": a["file"], "mime": a["mime"],
+            audio.append({"format": fmt, "src": "%s/%s" % (stamp, a["file"]), "mime": a["mime"],
                           "duration": media_duration(outputs[fmt])})
 
         vdur = tracks[0]["duration"]
-        make_thumb(outputs[cfg["videoTracks"][0]], vdur, int(cfg["thumbWidth"]), os.path.join(tmp, "thumb.jpg"))
+        make_thumb(outputs[cfg["videoTracks"][0]], vdur, int(cfg["thumbWidth"]), os.path.join(vdir, "thumb.jpg"))
         for kind in cfg["videoTracks"]:
             os.remove(outputs[kind])
 
-        stamp = hashlib.sha1(("%s|%s|%s|%s" % (key, mtime, size, time.time())).encode()).hexdigest()[:8]
         manifest = {
             "format": 1,
             "id": iid,
-            "title": clean_title(os.path.splitext(os.path.basename(rel))[0]),
-            "category": category,
-            "sort": rel.replace(os.sep, "/"),
+            "title": clean_title(readable(os.path.splitext(os.path.basename(rel))[0])),
+            "category": readable(category),
+            "sort": readable(rel.replace(os.sep, "/")),
             "duration": vdur,
             "v": stamp,
             "audio": audio,
             "tracks": tracks,
-            "thumb": "thumb.jpg",
+            "thumb": "%s/thumb.jpg" % stamp,
             "live": False,
-            "source": {"path": rel.replace(os.sep, "/"), "mtime": mtime, "size": size},
+            "source": {"path": readable(rel.replace(os.sep, "/")), "mtime": mtime, "size": size},
             "prepKey": key,
             "built": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         with open(os.path.join(tmp, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=1)
 
-        # Swap in atomically: a player that has the old manifest keeps working
-        # until it reloads.
+        # Keep the build a toy may be playing right now, then swap.
+        if os.path.isdir(out_dir):
+            prev = read_manifest(os.path.join(out_dir, "manifest.json"))
+            pv = prev and prev.get("v")
+            if pv and pv != stamp and os.path.isdir(os.path.join(out_dir, pv)):
+                os.rename(os.path.join(out_dir, pv), os.path.join(tmp, pv))
         old = os.path.join(media_dir, ".old-" + iid)
         shutil.rmtree(old, ignore_errors=True)
         if os.path.exists(out_dir):
@@ -501,6 +584,9 @@ def main(argv=None):
     ap.add_argument("--settle", type=int, default=60,
                     help="skip files modified in the last N seconds (still copying). Default 60")
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # never crash on printing an odd file name
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
 
     root = args.root or (DEFAULT_ROOT if os.path.isdir(DEFAULT_ROOT) else REPO_DIR)
     source_dir = os.path.abspath(args.source or os.path.join(root, "source"))
@@ -534,9 +620,15 @@ def main(argv=None):
         for i, (path, rel, category) in enumerate(sources, 1):
             if args.only and not fnmatch.fnmatch(rel.replace(os.sep, "/"), args.only):
                 continue
-            st = os.stat(path)
+            try:
+                st = os.stat(path)  # can vanish mid-run, or be a dangling link
+                iid = item_id(rel)
+            except (OSError, ValueError) as e:
+                failed += 1
+                failures.append(readable(rel))
+                log("[%d/%d] %s: FAILED: %s" % (i, len(sources), readable(rel), e))
+                continue
             mtime, size = int(st.st_mtime), st.st_size
-            iid = item_id(rel)
             out_dir = os.path.join(media_dir, iid)
             m = read_manifest(os.path.join(out_dir, "manifest.json"))
             fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime
@@ -546,10 +638,10 @@ def main(argv=None):
                 continue
             if now - st.st_mtime < args.settle:
                 log("[%d/%d] %s: modified %ds ago, maybe still copying - will pick it up next run"
-                    % (i, len(sources), rel, now - st.st_mtime))
+                    % (i, len(sources), readable(rel), now - st.st_mtime))
                 waiting += 1
                 continue
-            log("[%d/%d] %s  (%s, id %s)" % (i, len(sources), rel, category, iid))
+            log("[%d/%d] %s  (%s, id %s)" % (i, len(sources), readable(rel), readable(category), iid))
             t0 = time.time()
             try:
                 build_item(path, rel, category, out_dir, cfg, key, mtime, size)
@@ -562,7 +654,7 @@ def main(argv=None):
                 return 130
             except Exception as e:  # keep going with the rest of the library
                 failed += 1
-                failures.append(rel)
+                failures.append(readable(rel))
                 log("    FAILED: %s" % e)
 
         if args.prune:

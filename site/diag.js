@@ -257,7 +257,8 @@
   // Decode every frame as fast as possible and draw it: the result is the
   // device's maximum decode speed for this codec and size.
   function throughput(entry) {
-    var res = { clip: entry.clip, kind: entry.kind, codec: entry.codec, size: entry.width + 'x' + entry.height, kbps: entry.kbps };
+    var res = { clip: entry.clip, kind: entry.kind, codec: entry.codec, profile: entry.profile,
+                size: entry.width + 'x' + entry.height, kbps: entry.kbps };
     return loadClip(entry).then(function (clip) {
       var n = clip.frames.length, i = 0, out = 0, t0 = 0, first = 0, finished = false, b;
       return new Promise(function (resolve) {
@@ -413,6 +414,18 @@
 
   function fpsClass(fps) { return fps >= 40 ? 'ok' : fps >= 30 ? 'warn' : 'bad'; }
 
+  // Audio for the clock test, taken from the 480p clip's manifest. Loaded
+  // before the tap, because the tap handler must start playback directly.
+  var toneSrc = null;
+  function loadToneSrc() {
+    return TStream.getJSON('diag/clips/480/manifest.json').then(function (m) {
+      var a = document.createElement('audio');
+      for (var i = 0; i < m.audio.length && !toneSrc; i++) {
+        if (a.canPlayType(m.audio[i].mime)) toneSrc = 'diag/clips/480/' + m.audio[i].src;
+      }
+    }, function () {});
+  }
+
   function runTests() {
     $('run').disabled = true;
     $('tests').innerHTML = '';
@@ -420,8 +433,7 @@
 
     // Audio must start inside this tap, so create and play it right now.
     var a = document.createElement('audio');
-    var opus = R.audio['audio/ogg; codecs=opus'];
-    a.src = 'diag/clips/480/' + (opus ? 'audio.opus' : 'audio.mp3');
+    a.src = toneSrc || 'diag/clips/480/missing-audio';
     a.preload = 'auto';
     status('Testing audio clock...');
 
@@ -480,10 +492,18 @@
 
   // ---------------------------------------------------------- summary ---
 
-  function best(kind, height) {
+  // H.264 profile from the codec string: avc1.42.. Baseline, avc1.4D.. Main, avc1.64.. High
+  function profileOf(d) {
+    if (d.profile) return d.profile;
+    var p = /^avc1\.(..)/i.exec(d.codec || '');
+    return p ? ({ '42': 'baseline', '4D': 'main', '64': 'high' })[p[1].toUpperCase()] : null;
+  }
+
+  function best(kind, height, profile) {
     var r = null;
     R.tests.decode && R.tests.decode.forEach(function (d) {
-      if (d.kind === kind && +d.size.split('x')[1] === height && !d.error && (!r || d.fps > r.fps)) r = d;
+      if (d.kind === kind && +d.size.split('x')[1] === height && !d.error && (!profile || profileOf(d) === profile) &&
+          (!r || d.fps > r.fps)) r = d;
     });
     return r;
   }
@@ -492,7 +512,9 @@
     var S = R.summary = [];
     var host = location.hostname;
     var e = R.env, f = R.features;
-    var h264 = best('h264', 480), vp9 = best('vp9', 480), mp1 = best('mpeg1', 480), mp1s = best('mpeg1', 360);
+    // prep encodes H.264 Main by default; Baseline is only tested for comparison
+    var main = best('h264', 480, 'main'), base = best('h264', 480, 'baseline');
+    var vp9 = best('vp9', 480), mp1 = best('mpeg1', 480), mp1s = best('mpeg1', 360);
     var fast = function (d) { return d && d.fps >= 36; };
 
     if (!e.secureContext) {
@@ -500,12 +522,30 @@
         (R.https && R.https.trusted ? 'HTTPS works on this device: open https://' + host + '/diag.html and run the tests again.'
           : 'HTTPS is not trusted on this device. Either install http://' + host + '/ca.crt on it, or use the MPEG-1 mode (works over http).')]);
     }
-    if (fast(h264)) S.push(['ok', 'Best: WebCodecs + H.264 at 480p (' + h264.fps + ' fps max). The default config is right. Bookmark ' + location.protocol + '//' + host + '/']);
-    else if (fast(vp9)) S.push(['ok', 'Best: WebCodecs + VP9 at 480p (' + vp9.fps + ' fps). Set "videoTracks": ["vp9", "mpeg1"] in config.json.']);
-    if (fast(mp1)) S.push(['ok', 'MPEG-1 fallback works at 480p (' + mp1.fps + ' fps max).' + (!fast(h264) && !fast(vp9) ? ' This will be used automatically.' : '')]);
-    else if (fast(mp1s)) S.push(['warn', 'MPEG-1 is only fast enough at 360p (' + mp1s.fps + ' fps). Set "height": 360 in config.json.']);
-    else if (mp1 || mp1s) S.push(['bad', 'MPEG-1 decoding is too slow on this device (' + ((mp1 || mp1s).fps) + ' fps).']);
-    if (!fast(h264) && !fast(vp9) && !fast(mp1) && !fast(mp1s)) S.push(['bad', 'No mode reached 36 fps. Try "height": 360 and "maxFps": 25.']);
+    if (fast(main)) {
+      S.push(['ok', 'Best: WebCodecs + H.264 at 480p (' + main.fps + ' fps max). The default config is right. Bookmark ' +
+        location.protocol + '//' + host + '/']);
+    } else if (fast(base)) {
+      S.push(['ok', 'H.264 is only fast enough in the Baseline profile (' + base.fps + ' fps; Main ' +
+        (main ? main.fps + ' fps' : 'not supported') + '). Set "h264": {"profile": "baseline"} in config.json, then run prep --force.']);
+    } else if (fast(vp9)) {
+      S.push(['ok', 'Best: WebCodecs + VP9 at 480p (' + vp9.fps + ' fps). Set "videoTracks": ["vp9", "mpeg1"] in config.json, then run prep --force.']);
+    }
+    var webcodecsWins = fast(main) || fast(base) || fast(vp9);
+    if (fast(mp1)) {
+      var txt = 'MPEG-1 fallback works at 480p (' + mp1.fps + ' fps max).';
+      if (!webcodecsWins) {
+        // The player takes the first track WebCodecs *can* decode, whatever its speed.
+        txt += main ? ' But on this https page the player would pick H.264, which is too slow here (' + main.fps +
+          ' fps): set "videoTracks": ["mpeg1"] in config.json, or use the http:// address.' : ' It will be used automatically.';
+      }
+      S.push(['ok', txt]);
+    } else if (fast(mp1s)) {
+      S.push(['warn', 'MPEG-1 is only fast enough at 360p (' + mp1s.fps + ' fps). Set "height": 360 in config.json, then run prep --force.']);
+    } else if (mp1 || mp1s) {
+      S.push(['bad', 'MPEG-1 decoding is too slow on this device (' + ((mp1 || mp1s).fps) + ' fps).']);
+    }
+    if (!webcodecsWins && !fast(mp1) && !fast(mp1s)) S.push(['bad', 'No mode reached 36 fps. Try "height": 360 and "maxFps": 25.']);
 
     var rt = R.tests.realtime || [];
     rt.forEach(function (r) {
@@ -545,6 +585,7 @@
     }
     $('run').onclick = runTests;
     status('Checking codecs...');
+    loadToneSrc();
     getIndex().then(function (clips) {
       var extra = clips.map(function (c) { return c.codec; }).filter(function (c) { return c !== 'mpeg1video'; });
       return codecChecks(extra);

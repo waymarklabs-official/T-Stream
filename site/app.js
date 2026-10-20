@@ -25,7 +25,7 @@
   var player = null;
   var current = null;
   var audio = $('audio');
-  var timers = { hide: 0, ui: 0, save: 0, toast: 0 };
+  var timers = { hide: 0, ui: 0, save: 0, toast: 0, catalog: 0 };
   var wakeLock = null;
   var openedFromHome = false;
   var dragging = false;
@@ -53,13 +53,32 @@
     m.hidden = false;
   }
 
-  function loadCatalog(quiet) {
+  // Keep trying while there is nothing to show: the Pi or its hotspot may
+  // still be starting, or the first videos may still be converting. A toy's
+  // kid browser often has no reload button.
+  function retryCatalog(ms) {
+    clearTimeout(timers.catalog);
+    timers.catalog = setTimeout(function () { loadCatalog().then(route); }, ms);
+  }
+
+  function hasItems(c) {
+    var cats = (c && c.categories) || [];
+    for (var i = 0; i < cats.length; i++) if (cats[i].items.length) return true;
+    return false;
+  }
+
+  function loadCatalog() {
     return TStream.getJSON('media/catalog.json?t=' + Date.now()).then(function (c) {
       var changed = !catalog || catalog.generated !== c.generated;
       catalog = c;
       if (changed) buildHome();
-    }, function () {
-      if (!quiet) showMessage('No video library found yet.<br>Put videos in the <b>source</b> folder on the Pi and run <b>prep</b>.');
+      if (!hasItems(c)) retryCatalog(10000);
+    }, function (err) {
+      if (catalog) return; // keep showing the library we already have
+      showMessage(/HTTP 404/.test(err && err.message)
+        ? 'No video library found yet.<br>Put videos in the <b>source</b> folder on the Pi and run <b>prep</b>.'
+        : 'Can\'t reach the video box right now.<br>Trying again...');
+      retryCatalog(5000);
     });
   }
 
@@ -286,7 +305,8 @@
     var pos = store.get('pos.' + item.id, 0);
     var start = pos > 10 && pos < item.duration - 30 ? pos : 0;
     p.load(item.manifest, start).then(function () {
-      if (player === p) p.play();
+      // not if the screen went off or Home was pressed while loading
+      if (player === p && !document.hidden) p.play();
     }, noop);
 
     timers.ui = setInterval(updateUI, 250);
@@ -309,7 +329,7 @@
     $('home').hidden = false;
     renderGrid();
     window.scrollTo(0, homeScroll);
-    loadCatalog(true); // pick up videos that finished converting meanwhile
+    loadCatalog(); // pick up videos that finished converting meanwhile
   }
 
   function updateUI() {
@@ -360,8 +380,23 @@
     showControls();
   }
 
-  $('player').addEventListener('pointerdown', showControls, true);
-  $('player').addEventListener('touchstart', showControls, true);
+  // A tap on hidden controls only reveals them. Without this, the button
+  // that appears under the finger (Back, pause, the scrub bar...) would get
+  // the same tap, because Chrome hit-tests the click after the reveal.
+  var revealing = false;
+  function onPress(e) {
+    if (e.type === 'pointerdown' || !revealing) revealing = $('controls').classList.contains('hide');
+    if (e.type === 'touchstart' && revealing && e.cancelable) e.preventDefault(); // no click, no slider jump
+    showControls();
+  }
+  $('player').addEventListener('pointerdown', onPress, true);
+  $('player').addEventListener('touchstart', onPress, { capture: true, passive: false });
+  $('player').addEventListener('click', function (e) {
+    if (!revealing) return;
+    revealing = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
   $('back').addEventListener('click', goHome);
   $('errorback').addEventListener('click', goHome);
   $('bigplay').addEventListener('click', togglePlay);
@@ -380,10 +415,16 @@
     clearTimeout(timers.hide);
     $('elapsed').textContent = fmt(+scrub.value);
   });
-  scrub.addEventListener('change', function () {
+  // 'change' does not come if the thumb ends where it started or the touch
+  // is cancelled, so end the drag on any of these.
+  function endDrag() {
+    if (!dragging) return;
     dragging = false;
-    if (player) player.seek(+scrub.value);
+    if (player && Math.abs(+scrub.value - player.currentTime) > 0.3) player.seek(+scrub.value);
     showControls();
+  }
+  ['change', 'pointerup', 'pointercancel', 'touchend', 'touchcancel', 'blur'].forEach(function (t) {
+    scrub.addEventListener(t, endDrag);
   });
 
   // Debug overlay: tap the top-right corner 5 times.
@@ -431,7 +472,7 @@
   document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
   document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
 
-  loadCatalog(false).then(route);
+  loadCatalog().then(route);
 
   window.TStreamApp = { get player() { return player; }, store: store };
 })();

@@ -37,20 +37,20 @@ def read_pattern(gray, scale, bits, step, size):
 
 
 def decode_track(item_dir, track):
+    """Yields one grey picture per decoded frame (streamed: a 20 min clip
+    would not fit in memory as a list)."""
     ctx = av.CodecContext.create(CODECS[track["kind"]], "r")
     if track.get("description"):
         import base64
         ctx.extradata = base64.b64decode(track["description"])
-    out = []
     for seg in track["segments"]:
         for f in cvs.read_segment(os.path.join(item_dir, track["dir"], seg["file"])):
             pkt = av.Packet(f["data"])
             pkt.pts = f["pts"]
             for frame in ctx.decode(pkt):
-                out.append((f["pts"], frame.to_ndarray(format="gray")))
+                yield frame.to_ndarray(format="gray")
     for frame in ctx.decode(None):
-        out.append((None, frame.to_ndarray(format="gray")))
-    return out
+        yield frame.to_ndarray(format="gray")
 
 
 def beep_onsets(path):
@@ -76,14 +76,17 @@ def main():
             bits, step, size = (16, 50, 40) if long_clip else (9 if "Late" in m["title"] else 12, 60, 50)
             src_h = 480 if long_clip else (720 if "Counting" in m["title"] else 480)
             for t in m["tracks"]:
-                frames = decode_track(d, t)
                 scale = t["height"] / float(src_h)
-                bad = [(i, read_pattern(g, scale, bits, step, size)) for i, (_, g) in enumerate(frames)
-                       if read_pattern(g, scale, bits, step, size) != i % (1 << bits)]
-                status = "OK" if not bad and len(frames) == t["frames"] else "FAIL"
+                bad, count = [], 0
+                for i, g in enumerate(decode_track(d, t)):
+                    count += 1
+                    n = read_pattern(g, scale, bits, step, size)
+                    if n != i % (1 << bits):
+                        bad.append((i, n))
+                status = "OK" if not bad and count == t["frames"] else "FAIL"
                 ok &= status == "OK"
                 print("%-16s %-5s %4d frames decoded (%d expected), %d wrong frame numbers %s  %s"
-                      % (m["title"][:16], t["kind"], len(frames), t["frames"], len(bad), bad[:3], status))
+                      % (m["title"][:16], t["kind"], count, t["frames"], len(bad), bad[:3], status), flush=True)
             expect = 0.5 if "Late Audio" in m["title"] else 0.0
             for a in m["audio"]:
                 on = beep_onsets(os.path.join(d, a["src"]))

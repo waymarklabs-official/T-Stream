@@ -156,7 +156,8 @@ async function scenario(browser, label, url, title, layout) {
     }
     const heaps = samples.map(s => s.heap / 1e6);
     check('long run: frames correct', samples[samples.length - 1].wrong === 0, `wrong=${samples[samples.length - 1].wrong}`);
-    check('long run: caches bounded', Math.max(...samples.map(s => s.seg)) <= 6 && Math.max(...samples.map(s => s.q)) <= 6,
+    // pipeline cap: maxQueue (6) + 2 frames in flight for WebCodecs, 1 for MPEG-1
+    check('long run: caches bounded', Math.max(...samples.map(s => s.seg)) <= 6 && Math.max(...samples.map(s => s.q)) <= 8,
       `max segments ${Math.max(...samples.map(s => s.seg))}, max queued ${Math.max(...samples.map(s => s.q))}`);
     results.heapMB = heaps.map(h => +h.toFixed(1));
     results.longEnd = samples[samples.length - 1];
@@ -215,6 +216,43 @@ async function fallbackScenario(browser, mode, url, layout) {
   return { label: 'fallback-' + mode, backend: r.stats.backend, detail: r.stats.detail, codec: r.stats.codec, audio: r.stats.audio, checks };
 }
 
+// Touch screen: a tap on hidden controls must only reveal them, never press
+// the button or move the scrub bar that appears under the finger.
+async function touchScenario(browser, url) {
+  const ctx = await browser.newContext({ viewport: { width: 1024, height: 600 }, hasTouch: true, isMobile: true });
+  const page = await ctx.newPage();
+  const problems = [];
+  page.on('pageerror', e => problems.push('pageerror: ' + e.message));
+  await page.goto(url);
+  await page.waitForSelector('.card');
+  await page.locator('.card', { hasText: 'Counting Test' }).first().tap();
+  await waitFor(page, () => window.TStreamApp.player && window.TStreamApp.player.state === 'playing');
+  const center = async sel => page.evaluate(s => { const r = document.querySelector(s).getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }, sel);
+  const hidden = () => page.evaluate(() => document.getElementById('controls').classList.contains('hide'));
+  const checks = [];
+  for (const [sel, label] of [['#playpause', 'pause button'], ['#back', 'Back button'], ['#scrub', 'scrub bar']]) {
+    await page.waitForFunction(() => document.getElementById('controls').classList.contains('hide'), null, { timeout: 8000 });
+    let [x, y] = await center(sel);
+    if (sel === '#scrub') x = x + 250; // far from the current position
+    const before = await page.evaluate(() => ({ t: window.TStreamApp.player.currentTime, s: window.TStreamApp.player.state }));
+    await page.touchscreen.tap(x, y);
+    await page.waitForTimeout(700);
+    const after = await page.evaluate(() => ({ p: !!window.TStreamApp.player, t: window.TStreamApp.player && window.TStreamApp.player.currentTime, s: window.TStreamApp.player && window.TStreamApp.player.state }));
+    const ok = after.p && after.s === 'playing' && Math.abs(after.t - before.t) < 2 && !(await hidden());
+    checks.push({ name: `tap on hidden ${label} only shows the controls`, ok, detail: `before ${JSON.stringify(before)} after ${JSON.stringify(after)}` });
+  }
+  // a second tap, with controls visible, does press the button
+  const [bx, by] = await center('#fwd10');
+  const t0 = await page.evaluate(() => window.TStreamApp.player.currentTime);
+  await page.touchscreen.tap(bx, by);
+  await waitFor(page, t => window.TStreamApp.player.currentTime > t + 8, t0, 8000).catch(() => {});
+  const t1 = await page.evaluate(() => window.TStreamApp.player.currentTime);
+  checks.push({ name: 'tap on visible +10s works', ok: t1 > t0 + 8, detail: `${t0.toFixed(1)} -> ${t1.toFixed(1)}` });
+  checks.push({ name: 'touch: no page errors', ok: problems.length === 0, detail: problems.join(' | ') });
+  await ctx.close();
+  return { label: 'touch', backend: '-', detail: '', codec: '', audio: '', checks };
+}
+
 (async () => {
   const browser = await chromium.launch({
     args: ['--autoplay-policy=no-user-gesture-required', '--enable-precise-memory-info']
@@ -225,6 +263,7 @@ async function fallbackScenario(browser, mode, url, layout) {
   const which = opt.only ? opt.only.split(',') : ['auto', 'mpeg1'];
   for (const w of which) {
     if (w === 'crash' || w === 'stall') { runs.push(await fallbackScenario(browser, w, base, layout)); continue; }
+    if (w === 'touch') { runs.push(await touchScenario(browser, base)); continue; }
     const q = w === 'auto' ? '' : '?backend=' + w;
     const isLong = !!opt.long;
     runs.push(await scenario(browser, w, base + q, isLong ? 'Long Test' : 'Counting Test', isLong ? longLayout : layout));

@@ -224,6 +224,10 @@
       function () { return []; });
   }
 
+  // Download speed from the Pi, measured on the test-clip downloads. Over a
+  // remote link (Tailscale Funnel) this is the number that matters most.
+  var NET = { bytes: 0, ms: 0 };
+
   function loadClip(entry) {
     return TStream.getJSON('diag/clips/' + entry.manifest).then(function (m) {
       var track = null;
@@ -231,8 +235,12 @@
       var base = 'diag/clips/' + entry.clip + '/' + track.dir + '/';
       return sequence(track.segments, function (s) {
         return new Promise(function (resolve, reject) {
-          TStream.request(base + s.file, 'arraybuffer', function (err, buf) {
+          var t0 = now();
+          // ?t= skips the browser cache, so every test really downloads
+          TStream.request(base + s.file + '?t=' + Date.now(), 'arraybuffer', function (err, buf) {
             if (err) return reject(err);
+            NET.bytes += buf.byteLength;
+            NET.ms += now() - t0;
             s.parsed = TStream.parseSegment(buf);
             resolve();
           });
@@ -476,6 +484,12 @@
         });
       });
     }).then(function () {
+      if (NET.ms > 0) {
+        var mbps = Math.round(NET.bytes * 8 / NET.ms / 100) / 10; // bytes per ms -> Mbit/s
+        T.download = { bytes: NET.bytes, ms: Math.round(NET.ms), mbps: mbps };
+        testRow('Download speed from the Pi', mbps + ' Mbit/s (' + Math.round(NET.bytes / 1e5) / 10 + ' MB in ' +
+          Math.round(NET.ms / 100) / 10 + ' s)', mbps >= 4 ? 'ok' : mbps >= 2 ? 'warn' : 'bad');
+      }
       summarize();
       status('Sending report...');
       return sendReport('full');
@@ -558,6 +572,12 @@
     if (ac && ac.error) S.push(['bad', 'Audio did not play: ' + ac.error]);
     if (!f.WakeLock) S.push(['warn', 'Screen wake lock unavailable' + (e.secureContext ? '' : ' (needs https)') + ': set the toy\'s screen timeout to 30 minutes or more.']);
     if (!f.WebAssembly) S.push(['warn', 'No WebAssembly: MPEG-1 will use the slower JavaScript decoder.']);
+    var dl = R.tests.download;
+    if (dl && dl.mbps < 3) {
+      S.push([dl.mbps < 2 ? 'bad' : 'warn', 'Download from the Pi is only ' + dl.mbps + ' Mbit/s; videos need about 1-2 ' +
+        '(H.264) or 2-3 (MPEG-1) and may pause to buffer. If this is over the remote link, try at home; to make ' +
+        'videos smaller set "h264": {"crf": 27} and/or "height": 360, then run prep --force.']);
+    }
     if (e.androidWebView) S.push(['info', 'This browser is an Android WebView inside an app.']);
 
     var ul = $('summary');

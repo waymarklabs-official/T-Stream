@@ -43,14 +43,16 @@ ssh_connection() {
   done
 }
 
-# True if the SSH session runs over $IFACE (it drops when the Wi-Fi mode changes).
+# True if the SSH session runs over $IFACE (it drops when the Wi-Fi mode
+# changes). A session through Tailscale (remote-on) rides on the Wi-Fi too.
 ssh_over_wifi() {
   local conn client dev
   conn=$(ssh_connection)
   [ -n "$conn" ] || return 1
   client=${conn%% *}
   dev=$(ip route get "$client" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
-  [ "$dev" = "$IFACE" ]
+  case "$dev" in "$IFACE"|tailscale*) return 0 ;; esac
+  return 1
 }
 
 # The terminal is about to go away: log to a file from now on, so nothing is

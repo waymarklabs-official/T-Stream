@@ -115,7 +115,7 @@ def load_config(path):
 
 def prep_key(cfg):
     """Hash of every setting that changes the encoded output."""
-    relevant = {k: v for k, v in cfg.items() if k not in ("player", "hotspot")}
+    relevant = {k: v for k, v in cfg.items() if k not in ("player", "hotspot", "remote")}
     relevant["_v"] = PREP_VERSION
     return hashlib.sha1(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:12]
 

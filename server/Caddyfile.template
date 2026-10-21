@@ -1,6 +1,7 @@
-# T-Stream / canvas player - written by install.sh. Re-run install.sh to regenerate.
+# T-Stream / canvas player - written by caddy-config (install.sh, remote-on).
 # Serves @ROOT@/site over plain HTTP (:80) and HTTPS (:443) with a local
-# certificate authority, so the toy can use either.
+# certificate authority, so the toy can use either; plus a localhost-only port
+# for remote access through Tailscale Funnel (remote-on).
 {
 	# keep plain http:// working; never redirect it to https://
 	auto_https disable_redirects
@@ -11,9 +12,7 @@
 	}
 }
 
-(tstream) {
-	root * @ROOT@/site
-
+(tstream-log) {
 	log {
 		output file @LOG@ {
 			roll_size 20MiB
@@ -23,6 +22,10 @@
 		}
 		format json
 	}
+}
+
+(tstream-files) {
+	root * @ROOT@/site
 
 	# Phase 0: diag.html sends its report here; the access log keeps it.
 	@diag path /diag/report
@@ -61,6 +64,11 @@
 	file_server
 }
 
+(tstream) {
+	import tstream-log
+	import tstream-files
+}
+
 http:// {
 	import tstream
 }
@@ -78,6 +86,22 @@ https:// {
 		}
 	}
 	import tstream
+}
+
+# Remote access (remote-on): Tailscale Funnel forwards
+# https://<pi>.<tailnet>.ts.net:8443 to this port. Funnel makes it reachable
+# from the whole internet, so only the secret link /k/<key>/ serves anything;
+# every other path is a plain 404. Bound to localhost: not reachable on the LAN.
+http://:8099 {
+	bind 127.0.0.1
+	import tstream-log
+	redir /k/@REMOTE_KEY@ /k/@REMOTE_KEY@/
+	handle_path /k/@REMOTE_KEY@/* {
+		import tstream-files
+	}
+	handle {
+		respond 404
+	}
 }
 
 # Answers Caddy's own "may I issue a certificate for this name?" question.

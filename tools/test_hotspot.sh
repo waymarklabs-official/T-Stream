@@ -221,6 +221,12 @@ SSH_CONNECTION="10.42.0.20 50000 10.42.0.1 22" bash -c "env -u SSH_CONNECTION ba
 check "off via sudo (SSH_CONNECTION stripped): session still detected, output to the log" \
   test -n "$(grep 'will disconnect now' "$T/tty.out")" -a -n "$(grep 'Hotspot is OFF' "$HOTSPOT_LOG")"
 
+# SSH through Tailscale (remote-on) also rides on the Wi-Fi
+reset_nm TStream-Hotspot with-hotspot; export FAKE_SSH_DEV=tailscale0 SSH_CONNECTION="100.64.0.7 50000 100.64.0.9 22"
+bash "$OFF" > "$T/tty.out" 2>&1
+check "off over a Tailscale SSH session: treated as a session that will drop" \
+  test -n "$(grep 'will disconnect now' "$T/tty.out")" -a -n "$(grep 'Hotspot is OFF' "$HOTSPOT_LOG")"
+
 # ------------------------------------------------------------ boot safety net
 reset_nm HomeWiFi
 bash "$ON" --if-offline; rc=$?

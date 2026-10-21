@@ -65,28 +65,38 @@ step "Installing T-Stream into $ROOT"
 mkdir -p "$ROOT/source" "$ROOT/site/media" "$ROOT/bin" "$ROOT/diag-reports"
 rsync -a --delete --exclude /media/ --exclude /ca.crt --exclude /diag/last-report.json "$REPO/site/" "$ROOT/site/"
 install -m 0644 "$REPO/prep/prep.py" "$REPO/prep/cvs.py" "$ROOT/bin/"
-for s in prep hotspot-on hotspot-off read-diag tstream; do
+for s in prep hotspot-on hotspot-off read-diag tstream remote-on remote-off; do
   install -m 0755 "$REPO/bin/$s.sh" "$ROOT/bin/$s.sh"
   ln -sf "$ROOT/bin/$s.sh" "/usr/local/bin/$s"
 done
 install -m 0644 "$REPO/bin/wifi-common.sh" "$ROOT/bin/wifi-common.sh"
+install -m 0755 "$REPO/bin/caddy-config.sh" "$ROOT/bin/caddy-config.sh"
+install -m 0644 "$REPO/server/Caddyfile.template" "$ROOT/bin/Caddyfile.template"
 touch /var/log/tstream-hotspot.log
 
 if [ ! -f "$ROOT/config.json" ]; then
   cp "$REPO/config.json" "$ROOT/config.json"
 fi
-# Replace the placeholder hotspot password with a random, easy-to-type one.
+# Random, easy-to-type secrets: the hotspot password (replacing the
+# placeholder) and the secret part of the remote link (remote-on).
 python3 - "$ROOT/config.json" <<'PYEOF'
 import json, random, re, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
+abc = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (l/1, o/0, i)
+rnd = random.SystemRandom()
+changed = False
 hs = cfg.setdefault("hotspot", {})
 pw = hs.get("password", "change-me-please")
 # placeholder, or the weak 4-digit style of earlier versions
 if pw == "change-me-please" or re.match(r"^play-\d{4}-tv$", pw):
-    abc = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (l/1, o/0, i)
-    rnd = random.SystemRandom()
     hs["password"] = "-".join("".join(rnd.choice(abc) for _ in range(4)) for _ in range(3))  # ~59 bits
+    changed = True
+rm = cfg.setdefault("remote", {})
+if not re.match(r"^[a-z0-9]{12,}$", str(rm.get("key", ""))):
+    rm["key"] = "".join(rnd.choice(abc) for _ in range(14))  # ~69 bits
+    changed = True
+if changed:
     json.dump(cfg, open(p, "w"), indent=2)
 PYEOF
 
@@ -111,18 +121,8 @@ for port in 80 443; do
 done
 mkdir -p /var/log/caddy
 chown caddy:caddy /var/log/caddy 2>/dev/null || true
-if [ -f /etc/caddy/Caddyfile ] && ! grep -q "T-Stream" /etc/caddy/Caddyfile; then
-  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.before-tstream.$(date +%Y%m%d%H%M%S)"
-  echo "Saved your previous Caddyfile next to it."
-fi
-sed -e "s#@ROOT@#$ROOT#g" -e "s#@LOG@#$LOG#g" "$REPO/server/Caddyfile.template" > /etc/caddy/Caddyfile
-if ! out=$(caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1); then
-  echo "$out" | tail -5
-  warn "The generated Caddyfile is invalid"
-  exit 1
-fi
 systemctl enable caddy >/dev/null 2>&1 || true
-systemctl restart caddy
+CANVAS_ROOT="$ROOT" CANVAS_LOG="$LOG" "$ROOT/bin/caddy-config.sh" || { warn "Could not configure Caddy"; exit 1; }
 
 # Ask for one https page so Caddy creates its local certificate authority,
 # then publish the (public) root certificate for the toy at /ca.crt.

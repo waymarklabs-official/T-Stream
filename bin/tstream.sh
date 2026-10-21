@@ -52,6 +52,13 @@ except (OSError, ValueError, KeyError):
     print("  \033[31m%-14s\033[0m empty - put videos in %s/source and run: prep" % ("library", root))
 PYEOF
 if systemctl is-active --quiet canvas-prep.timer; then ok "auto-convert" "every 15 min (new files in $ROOT/source)"; fi
+if [ -r "$ROOT/remote-url.txt" ]; then
+  ok "remote" "ON  -> $(cat "$ROOT/remote-url.txt")"
+elif [ -e "$ROOT/remote-url.txt" ]; then
+  ok "remote" "ON  (link: sudo cat $ROOT/remote-url.txt)"
+else
+  ok "remote" "off (watch from anywhere: remote-on)"
+fi
 if systemctl is-enabled --quiet tstream-wifi-fallback.service 2>/dev/null; then
   ok "safety net" "no Wi-Fi 3 min after boot -> hotspot starts (log: /var/log/tstream-hotspot.log)"
 fi
@@ -64,5 +71,7 @@ Commands:
   hotspot-off     back to normal Wi-Fi
   read-diag       show the latest report from diag.html on the toy
   tstream         this screen
+  remote-on       watch from anywhere with internet (Tailscale, secret link; nothing on the toy)
+  remote-off      stop remote access
   tstream update  get the newest version and reinstall (keeps videos and settings)
 EOF

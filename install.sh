@@ -6,9 +6,10 @@
 # Safe to run again at any time (after `git pull`, to update): it keeps your
 # videos, library and config.json, and only replaces the program files.
 #
-# Installs: Caddy (web server, http :80 + https :443), FFmpeg, Python PyAV.
-# Creates:  /srv/canvas-player/{source,site,bin,config.json}
-# Commands: prep, hotspot-on, hotspot-off, read-diag, tstream
+# Installs: Caddy (web server, http :80 + https :443), FFmpeg, Python PyAV,
+#           yt-dlp (+ Deno) for the add-videos page.
+# Creates:  /srv/canvas-player/{source,site,bin,add,state,yt-dlp,config.json}
+# Commands: prep, hotspot-on, hotspot-off, read-diag, tstream, remote-on, remote-off
 # Leaves Kodi and everything else alone.
 set -euo pipefail
 
@@ -34,7 +35,7 @@ warn() { printf '\033[1;31m!!  %s\033[0m\n' "$*"; }
 step "Installing packages (this can take a few minutes the first time)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q || warn "apt-get update had problems; continuing with what is cached"
-apt-get install -y -q --no-install-recommends ffmpeg python3 ca-certificates curl rsync iproute2 gnupg
+apt-get install -y -q --no-install-recommends ffmpeg python3 python3-venv ca-certificates curl rsync iproute2 gnupg
 
 if ! python3 -c 'import av' 2>/dev/null; then
   apt-get install -y -q python3-av || true
@@ -62,9 +63,12 @@ echo "ffmpeg $(ffmpeg -version | head -1 | cut -d' ' -f3), PyAV $(python3 -c 'im
 
 # ---------------------------------------------------------------- files ---
 step "Installing T-Stream into $ROOT"
-mkdir -p "$ROOT/source" "$ROOT/site/media" "$ROOT/bin" "$ROOT/diag-reports"
+mkdir -p "$ROOT/source" "$ROOT/site/media" "$ROOT/bin" "$ROOT/diag-reports" "$ROOT/state" "$ROOT/add"
 rsync -a --delete --exclude /media/ --exclude /ca.crt --exclude /diag/last-report.json "$REPO/site/" "$ROOT/site/"
+# the add-videos page lives outside site/: site/ is also what the Funnel link serves
+rsync -a --delete --exclude __pycache__ "$REPO/add/" "$ROOT/add/"
 install -m 0644 "$REPO/prep/prep.py" "$REPO/prep/cvs.py" "$ROOT/bin/"
+install -m 0755 "$REPO/bin/yt-dlp-update.sh" "$ROOT/bin/yt-dlp-update.sh"
 for s in prep hotspot-on hotspot-off read-diag tstream remote-on remote-off; do
   install -m 0755 "$REPO/bin/$s.sh" "$ROOT/bin/$s.sh"
   ln -sf "$ROOT/bin/$s.sh" "/usr/local/bin/$s"
@@ -103,7 +107,8 @@ PYEOF
 echo "$OWNER" > "$ROOT/.owner"
 echo "$REPO" > "$ROOT/.repo"   # for `tstream update`
 chmod 755 /srv "$ROOT" "$ROOT/bin" "$ROOT/site"
-chown -R "$OWNER": "$ROOT/source" "$ROOT/site/media" "$ROOT/diag-reports" "$ROOT/config.json"
+chown -R "$OWNER": "$ROOT/source" "$ROOT/site/media" "$ROOT/diag-reports" "$ROOT/config.json" "$ROOT/state"
+chmod 0750 "$ROOT/state"   # the add-videos PIN and phone sessions
 touch "$ROOT/prep.log" && chown "$OWNER": "$ROOT/prep.log"
 mkdir -p "$ROOT/site/diag" && touch "$ROOT/site/diag/last-report.json"
 # Rebuild the catalog so the player settings from config.json take effect.
@@ -166,6 +171,58 @@ EOF
 systemctl daemon-reload
 systemctl enable --now canvas-prep.timer >/dev/null 2>&1 || warn "could not enable the auto-convert timer"
 
+# ------------------------------------------------------- add-videos page ---
+step "Add-videos page: send YouTube links and phone videos to the toy (http://<pi>/add/)"
+if [ -d "$ROOT/yt-dlp" ] && [ "$(stat -c %U "$ROOT/yt-dlp")" != "$OWNER" ]; then
+  chown -R "$OWNER": "$ROOT/yt-dlp"
+fi
+if ! out=$(timeout 900 "$ROOT/bin/yt-dlp-update.sh" 2>&1); then
+  echo "$out" | tail -5
+  warn "Could not install the YouTube downloader (no internet?). The page works for phone videos; run tstream update later for YouTube."
+else
+  echo "$out" | tail -1
+fi
+case "$(dpkg --print-architecture 2>/dev/null)" in
+  armhf|armel)
+    warn "This is the 32-bit Raspberry Pi OS: YouTube downloads lack the Deno helper, and made-for-kids videos may fail."
+    warn "The 64-bit Raspberry Pi OS fixes that (it needs a fresh install of the SD card)." ;;
+esac
+cat > /etc/systemd/system/tstream-add.service <<UNIT
+[Unit]
+Description=T-Stream: add-videos page for your phone (/add/)
+After=network.target
+
+[Service]
+User=$OWNER
+Environment=CANVAS_ROOT=$ROOT HOME=$ROOT/state/home XDG_CACHE_HOME=$ROOT/state/cache DENO_DIR=$ROOT/state/cache/deno
+ExecStart=/usr/bin/python3 -u $ROOT/add/addserver.py --root $ROOT
+Restart=on-failure
+RestartSec=5
+# prep, started from here for new videos, converts in the background
+Nice=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=$ROOT
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo -u "$OWNER" mkdir -p "$ROOT/state/home" "$ROOT/state/cache"
+if ! grep -qE '^[0-9]{4,12}$' "$ROOT/state/add-pin.txt" 2>/dev/null; then
+  (umask 077; python3 -c 'import secrets; print("%06d" % secrets.randbelow(10**6))' > "$ROOT/state/add-pin.txt")
+  chown "$OWNER": "$ROOT/state/add-pin.txt"
+fi
+systemctl daemon-reload
+systemctl enable tstream-add.service >/dev/null 2>&1 || true
+systemctl restart tstream-add.service || warn "the add-videos page did not start (journalctl -u tstream-add)"
+# The https address for the phone over Tailscale (needed to share straight
+# from the YouTube app on Android); only private to your Tailscale devices.
+if command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"'; then
+  "$ROOT/bin/remote-on.sh" --add-page || true
+fi
+
 # -------------------------------------------------------- Wi-Fi safety net ---
 if command -v nmcli >/dev/null; then
   step "Wi-Fi safety net: if the Pi joins no Wi-Fi within 3 minutes of booting, it starts its hotspot"
@@ -200,7 +257,8 @@ pass=$(python3 -c "import json;print(json.load(open('$ROOT/config.json'))['hotsp
 cat <<EOF
 Player:       http://${ip4:-<pi-address>}/      (and http://$(hostname).local/)
 Diagnostics:  http://${ip4:-<pi-address>}/diag.html   <- open this on the toy first (Phase 0)
-Videos go in: $ROOT/source/<Category>/    then run: prep   (or wait for auto-convert)
+Add videos:   http://${ip4:-<pi-address>}/add/   on your phone, PIN $(cat "$ROOT/state/add-pin.txt" 2>/dev/null || echo "(see: tstream)")
+              (or copy files to $ROOT/source/<Category>/; they are converted within 15 minutes)
 Hotspot:      hotspot-on   -> Wi-Fi "$ssid", password "$pass", player at http://10.42.0.1/
 Status/help:  tstream
 EOF

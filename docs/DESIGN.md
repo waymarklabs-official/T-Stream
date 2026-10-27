@@ -81,6 +81,67 @@ a time and emits segments as they complete, so a `live.py` can append to a
 manifest with `"live": true`. The player would poll the manifest; nothing in
 the format blocks this.
 
+## Adding videos from a phone (`add/addserver.py`)
+
+A small Python service (standard library only) on `127.0.0.1:8098`, run as
+the library owner by `tstream-add.service`. Caddy forwards `/add/*` to it from
+the `http://` and `https://` sites only, after checking that the client is on
+a private, hotspot, Tailscale or loopback address. The `:8099` site that
+Tailscale Funnel puts on the internet does not import that route, and
+`e2e-add` checks that `/add/` and `/k/<key>/add/` are 404 there. The page's
+files live in `$ROOT/add/`, not in `site/`, so the Funnel link can't serve
+them either.
+
+- **Access:** a 6-digit PIN (`state/add-pin.txt`), 5 tries per address per
+  5 minutes and 50 per hour overall. A correct PIN gives the phone a one-year
+  HttpOnly cookie. API calls must carry an `X-TStream` header, so other web
+  sites can't use the cookie. iPhone Shortcuts send a key (`X-TStream-Key`)
+  made on the page. `tstream new-pin` empties `state/add-sessions.json`,
+  which ends every cookie and key.
+- **Uploads** go in 8 MB pieces (`PUT .../upload/<id>?offset=N`) into
+  `source/.incoming/<id>.part`. prep never looks in dot folders. Each piece is
+  fsynced, and one that is cut off is truncated back, so the file is always
+  whole up to its offset. A wrong offset gets 409 with the right one. The id
+  comes from category + name + size + lastModified, so picking the same file
+  after a reload resumes it.
+- **Finished files** are hard-linked to `source/<Category>/<Title>.<ext>`.
+  Linking never overwrites; ` (2)` is added when the name is taken. If the
+  drive can't hard-link, the name is claimed with `O_EXCL` and the file
+  renamed. The file time is set to 61 s ago, so prep doesn't wait for "still
+  copying". Then the service starts prep if none is running.
+- **YouTube** goes through yt-dlp in `$ROOT/yt-dlp`, a venv owned by the
+  library owner, with Deno from the `[deno]` extra on 64-bit.
+  - The page updates it to the nightly build once a day before downloading,
+    and once more when a download fails in a way that usually means it is out
+    of date.
+  - Command line: `-f bv*+ba/b -S res:480,vcodec:h264,acodec:aac`, which is
+    480 on the short side so Shorts aren't tiny, and H.264 when available
+    because the Pi decodes it fastest. Plus `--no-playlist`, `--ignore-config`,
+    `--match-filters !is_live`, and machine-readable `--print` and
+    `--progress-template` lines.
+  - Downloads run one at a time, with a short pause in between: YouTube
+    allows a guest a few hundred videos an hour.
+  - A ledger (`state/add-ledger.json`) of video ids answers "already on the
+    toy". It also stops a watched playlist from bringing back a video that
+    was removed on purpose.
+- **Removing** a video deletes its source file and drops a `.removed` marker
+  in its media folder. `build_catalog` skips marked items at once, under a
+  lock shared with prep. prep deletes the files 10 minutes later, after any
+  toy still playing it is done.
+- **Conversion progress** comes from `state/prep-status.json`, which prep
+  writes atomically at most every 2 s.
+
+prep changes that came with it:
+- It rescans `source/` after every video and converts the newest file first,
+  so a video added while a long batch runs doesn't wait for the batch.
+- It checks free space before starting ffmpeg (worst-case bytes per hour per
+  track, plus 300 MB).
+- It remembers failed files (by mtime, size and settings) and only retries
+  them when they change or with `--force`. "Not enough space" is always
+  retried.
+- It deletes a rebuilt video's previous version 6 h after the rebuild.
+- It discards a build whose source was removed meanwhile.
+
 ## Encoding on another computer
 
 Encoding is faster on a desktop (needs Python 3, FFmpeg, `pip install av`):
@@ -108,6 +169,11 @@ node tools/e2e-robust.js http://127.0.0.1/     # size change, missing segment, d
                                                # lip-sync offset, Back while loading, racing seeks
 node tools/e2e-diag.js http://127.0.0.1/
 tools/make_diag_clips.py                            # regenerates site/diag/clips
+tools/test_add.py       # add-videos service + real prep, fake yt-dlp: PIN, uploads (resume, cut-off
+                        # pieces, chunked), links, errors, yt-dlp update+retry, playlists, removal, keys
+tools/e2e-add.sh        # the page at phone size through Caddy (spare ports): paste, 3-piece upload,
+                        # toy picks it up by itself, removal, share target, Funnel port can't reach /add/
+tools/test_hotspot.sh   # hotspot scripts against a fake NetworkManager
 ```
 
 `e2e.js` reads the frame number back off the canvas after every draw, and

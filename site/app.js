@@ -31,6 +31,7 @@
   var dragging = false;
   var homeScroll = 0;
   var audioUnlocked = false;
+  var lastTouch = 0;
 
   function fmt(t) {
     t = Math.max(0, Math.floor(t || 0));
@@ -471,6 +472,14 @@
   // Block the long-press menu and pinch zoom that toddlers trigger.
   document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
   document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+
+  // Videos added from the phone appear on the home screen by themselves,
+  // but never while a finger is on the grid (cards would move under it).
+  document.addEventListener('touchstart', function () { lastTouch = Date.now(); }, true);
+  document.addEventListener('pointerdown', function () { lastTouch = Date.now(); }, true);
+  setInterval(function () {
+    if (!current && catalog && !document.hidden && Date.now() - lastTouch > 30000) loadCatalog();
+  }, 60000);
 
   loadCatalog().then(route);
 

@@ -2,7 +2,21 @@
 # T-Stream status and help.
 #   tstream          status + list of commands
 #   tstream update   download the newest version and reinstall (keeps videos/config)
+#   tstream new-pin  new PIN for the add-videos page (logs out every phone)
 ROOT=${CANVAS_ROOT:-/srv/canvas-player}
+
+if [ "${1:-}" = new-pin ]; then
+  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
+  if [ "$(id -un)" != "$owner" ] && [ "$(id -u)" -ne 0 ]; then
+    exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
+  fi
+  pin=$(python3 -c 'import secrets; print("%06d" % secrets.randbelow(10**6))')
+  (umask 077; echo "$pin" > "$ROOT/state/add-pin.txt"; echo '{}' > "$ROOT/state/add-sessions.json")
+  [ "$(id -u)" -ne 0 ] || chown "$owner": "$ROOT/state/add-pin.txt" "$ROOT/state/add-sessions.json"
+  echo "New PIN for the add-videos page: $pin"
+  echo "Every phone and iPhone Shortcut has to log in again (Shortcuts: make a new key on the page)."
+  exit 0
+fi
 
 if [ "${1:-}" = update ]; then
   if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx TStream-Hotspot; then
@@ -52,6 +66,37 @@ except (OSError, ValueError, KeyError):
     print("  \033[31m%-14s\033[0m empty - put videos in %s/source and run: prep" % ("library", root))
 PYEOF
 if systemctl is-active --quiet canvas-prep.timer; then ok "auto-convert" "every 15 min (new files in $ROOT/source)"; fi
+if systemctl is-active --quiet tstream-add.service; then
+  pin=$(cat "$ROOT/state/add-pin.txt" 2>/dev/null || echo "see: sudo tstream")
+  ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v ':' | grep -v '^$' | head -1)
+  ok "add videos" "http://${ip:-<pi-address>}/add/   PIN $pin"
+  if [ -s "$ROOT/state/add-https-url.txt" ]; then
+    ok "" "$(cat "$ROOT/state/add-https-url.txt")   (phone with Tailscale on; Android: install it to share from YouTube)"
+  fi
+else
+  bad "add videos" "NOT running (sudo systemctl restart tstream-add; log: journalctl -u tstream-add)"
+fi
+python3 - "$ROOT" <<'PYEOF2'
+import json, os, shutil, sys
+root = sys.argv[1]
+try:
+    free = shutil.disk_usage(os.path.join(root, "site", "media")).free
+except OSError:
+    sys.exit(0)
+st = {}
+try:
+    st = json.load(open(os.path.join(root, "state", "prep-status.json")))
+except (OSError, ValueError):
+    pass
+line = "%.1f GB free" % (free / 1e9)
+if st.get("running") and st.get("current"):
+    c = st["current"]
+    line += "; converting %s (%d%%), %d waiting" % (c.get("path"), c.get("pct", 0), len(st.get("pending") or []))
+failed = [k for k, v in (st.get("failed") or {}).items() if not v.get("retry")]
+if failed:
+    line += "; %d file(s) could not be converted (see prep.log)" % len(failed)
+print("  \033[32m%-14s\033[0m %s" % ("space", line))
+PYEOF2
 if [ -r "$ROOT/remote-url.txt" ]; then
   ok "remote" "ON  -> $(cat "$ROOT/remote-url.txt")"
 elif [ -e "$ROOT/remote-url.txt" ]; then
@@ -73,5 +118,6 @@ Commands:
   tstream         this screen
   remote-on       watch from anywhere with internet (Tailscale, secret link; nothing on the toy)
   remote-off      stop remote access
+  tstream new-pin new PIN for the add-videos page (logs every phone out)
   tstream update  get the newest version and reinstall (keeps videos and settings)
 EOF

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2563eb">
+<meta name="referrer" content="no-referrer">
+<title>Add videos</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-title" content="Add videos">
+<link rel="stylesheet" href="add.css">
+</head>
+<body>
+<header>
+  <h1>Add videos</h1>
+  <p id="space" class="space" hidden></p>
+</header>
+
+<main>
+  <section id="login" class="card" hidden>
+    <h2>Enter the PIN</h2>
+    <p class="hint">The PIN is shown on the Pi when you type <code>tstream</code>. This phone remembers it.</p>
+    <form id="loginform">
+      <input id="pin" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*"
+             maxlength="12" placeholder="PIN" aria-label="PIN">
+      <button class="primary" type="submit">Continue</button>
+      <p id="loginmsg" class="msg" role="status"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card">
+      <label for="cat" class="big">Category on the toy</label>
+      <select id="cat"></select>
+      <input id="newcat" type="text" maxlength="60" placeholder="Name of the new category" hidden>
+    </section>
+
+    <section class="card">
+      <h2>From YouTube</h2>
+      <form id="linkform">
+        <input id="link" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+               placeholder="Paste a YouTube link here" aria-label="YouTube link">
+        <label id="playlistopt" class="check" hidden>
+          <input id="watch" type="checkbox" checked>
+          Keep watching this playlist: videos added to it later come to the toy by themselves
+        </label>
+        <details id="titlebox">
+          <summary>Change the title (optional)</summary>
+          <input id="title" type="text" maxlength="120" placeholder="Title shown on the toy">
+        </details>
+        <button id="send" class="primary" type="submit">Send to the toy</button>
+        <p id="linkmsg" class="msg" role="status"></p>
+      </form>
+      <p class="hint">In the YouTube app tap <b>Share</b>, then <b>Copy link</b>. Here, press and hold in the box and
+        tap <b>Paste</b>: it is sent right away. <a href="#help" id="sharehelp">Or share straight from YouTube</a>.</p>
+    </section>
+
+    <section class="card">
+      <h2>From this phone</h2>
+      <input id="files" type="file" multiple hidden>
+      <button id="pick" class="primary" type="button">Choose videos</button>
+      <p id="upmsg" class="msg" role="status"></p>
+      <p class="hint">Videos from Google Drive or iCloud work too: pick them under <b>Browse</b> / <b>Drive</b>.
+        Keep this page open until it says <b>On the toy</b> or <b>Converting</b>; if the phone locks, it continues when
+        you come back.</p>
+    </section>
+
+    <section class="card">
+      <h2>Activity</h2>
+      <ul id="jobs" class="jobs"></ul>
+      <p id="nojobs" class="hint">Nothing yet. Videos you add show up here.</p>
+    </section>
+
+    <section id="watched" class="card" hidden>
+      <h2>Watched playlists</h2>
+      <ul id="playlists" class="jobs"></ul>
+    </section>
+
+    <section class="card">
+      <details id="librarybox">
+        <summary><h2>On the toy</h2></summary>
+        <ul id="library" class="library"></ul>
+      </details>
+    </section>
+
+    <section class="card" id="help">
+      <details id="helpbox">
+        <summary><h2>Help and settings</h2></summary>
+        <h3>Share straight from the YouTube app</h3>
+        <div id="androidhelp">
+          <p><b>Android:</b> with Tailscale on, open <a id="httpslink" href="#"></a> in Chrome, tap <b>⋮</b>, then
+            <b>Install app</b> (or <b>Add to Home screen</b> → <b>Install</b>). After that, YouTube's <b>Share</b> menu
+            has <b>Add videos</b> (look under <b>More</b> the first time).</p>
+          <p id="nohttps" class="hint" hidden>This needs the Pi's Tailscale https address. On the Pi run
+            <code>remote-on</code> once; the address then appears here.</p>
+        </div>
+        <div id="iphonehelp">
+          <p><b>iPhone:</b> make a Shortcut once (about 5 minutes); then YouTube's <b>Share</b> menu has
+            <b>Send to toy</b>, and the toy gets the video with no more taps.</p>
+          <button id="makekey" type="button">Show the Shortcut steps</button>
+          <ol id="shortcutsteps" hidden>
+            <li>Open the <b>Shortcuts</b> app, tap <b>+</b>, and name the shortcut <b>Send to toy</b>.</li>
+            <li>Tap <b>ⓘ</b> (Details) and turn on <b>Show in Share Sheet</b>. Back in the shortcut, in the
+              <b>Receive … from Share Sheet</b> line keep only <b>URLs</b> and <b>Text</b>, and set
+              <b>If there's no input</b> to <b>Get Clipboard</b>.</li>
+            <li>Add the action <b>Get Contents of URL</b>. URL: <code id="sc-url" class="copy"></code></li>
+            <li>In that action tap <b>Show More</b>: Method <b>POST</b>. Under Headers add
+              <code>X-TStream-Key</code> with the value <code id="sc-key" class="copy"></code>. Request Body
+              <b>JSON</b>: add a <b>Text</b> field named <code>url</code> and set it to <b>Shortcut Input</b>.</li>
+            <li>Add <b>Get Dictionary Value</b>: Value for <code>message</code> in <b>Contents of URL</b>.</li>
+            <li>Add <b>Show Notification</b> with <b>Dictionary Value</b>.</li>
+            <li>Try it: in YouTube tap <b>Share</b> → <b>More</b> → <b>Send to toy</b>; allow it to connect when
+              asked (<b>Always Allow</b>). Tip: <b>Edit Actions</b> in that menu puts it at the top.</li>
+          </ol>
+          <p id="sc-tailscale" class="hint" hidden>The Shortcut needs the Tailscale app connected on this phone.</p>
+          <p class="hint">Tap a grey box to copy it. Videos go to the category last used on this page. The key works
+            like the PIN; <code>tstream new-pin</code> on the Pi cancels every key.</p>
+        </div>
+        <h3>This phone</h3>
+        <p class="hint">Tip: tap the Share button in your browser and <b>Add to Home Screen</b>, so this page is one tap
+          away.</p>
+        <button id="logout" type="button">Log out on this phone</button>
+      </details>
+    </section>
+  </div>
+</main>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="add.js"></script>
+</body>
+</html>

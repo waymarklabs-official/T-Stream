@@ -39,6 +39,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -144,10 +145,12 @@ def natural_key(s):
 
 
 def clean_title(stem):
-    # "Peppa_Pig.S01E01" style names use dots/underscores as spaces; a name
-    # that already has spaces keeps them ("Mr. Men", added from YouTube)
+    # Underscores are always spaces. Dots are too in "Peppa.Pig.S01E01"
+    # style names, but not in a title with more spaces than dots ("Mr. Men").
     words = re.sub(r"[\[\(\{][^\]\)\}]*[\]\)\}]", "", stem).strip()
-    t = stem if " " in words else re.sub(r"[._]+", " ", stem)
+    t = stem.replace("_", " ")
+    if words.count(".") > words.count(" "):
+        t = t.replace(".", " ")
     # drop release-style tags like [1080p], (x264), {WEB-DL}
     t = re.sub(r"[\[\(\{][^\]\)\}]*\b(\d{3,4}p|x26[45]|h\.?26[45]|hevc|web|dl|rip|bluray|aac|ac3|uhd|hdr)\b[^\]\)\}]*[\]\)\}]",
                "", t, flags=re.I)
@@ -394,21 +397,25 @@ def run_ffmpeg_with_progress(cmd, duration, label, progress=None):
             time.sleep(5)
     threading.Thread(target=watchdog, daemon=True).start()
 
-    for line in p.stdout:
-        alive[0] = time.time()
-        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
-            try:
-                t = int(line.split("=", 1)[1]) / 1e6
-            except ValueError:
-                continue
-            if duration:
-                pct = int(min(99, t * 100 / duration))
-                if progress:
-                    progress(pct)
-                if pct >= last + 10:
-                    last = pct
-                    speed = t / max(0.001, time.time() - start)
-                    log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, speed))
+    try:
+        for line in p.stdout:
+            alive[0] = time.time()
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    t = int(line.split("=", 1)[1]) / 1e6
+                except ValueError:
+                    continue
+                if duration:
+                    pct = int(min(99, t * 100 / duration))
+                    if progress:
+                        progress(pct)
+                    if pct >= last + 10:
+                        last = pct
+                        speed = t / max(0.001, time.time() - start)
+                        log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, speed))
+    finally:
+        if p.poll() is None:  # we were stopped: stop ffmpeg too
+            p.kill()
     p.wait()
     errf.seek(0)
     err = errf.read().decode("utf-8", "replace")
@@ -741,28 +748,40 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
 
+    # stopped by systemd (service restart, shutdown): clean up like Ctrl-C
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(143))
     root = args.root or (DEFAULT_ROOT if os.path.isdir(DEFAULT_ROOT) else REPO_DIR)
     source_dir = os.path.abspath(args.source or os.path.join(root, "source"))
     media_dir = os.path.abspath(args.media or os.path.join(root, "site", "media"))
     config_path = args.config or os.path.join(root, "config.json")
     if not os.path.exists(config_path):
         config_path = os.path.join(REPO_DIR, "config.json")
-    cfg = load_config(config_path)
-    key = prep_key(cfg)
-    os.makedirs(media_dir, exist_ok=True)
     state_dir = args.state
     if state_dir is None and (args.root or root == DEFAULT_ROOT):
         state_dir = os.path.join(root, "state")
-    if state_dir:
-        os.makedirs(state_dir, exist_ok=True)
-
     try:
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        cfg = load_config(config_path)
+        key = prep_key(cfg)
+        os.makedirs(media_dir, exist_ok=True)
         with Lock(os.path.join(media_dir, ".prep.lock"), wait=not args.no_wait,
                   say="another prep is running; waiting for it to finish..."):
             return run_prep(args, cfg, key, source_dir, media_dir, config_path, state_dir)
     except Busy:
         log("a conversion is running right now; the library list updates when it finishes")
         return 0
+    except SystemExit as e:  # can't run at all (no FFmpeg, bad config.json): tell the add page
+        if state_dir and isinstance(e.code, str):
+            path = os.path.join(state_dir, "prep-status.json")
+            st = read_manifest(path) or {}
+            st.update(running=False, current=None, error=e.code, updated=datetime.datetime.now().isoformat(
+                timespec="seconds"))
+            try:
+                write_json(path, st)
+            except OSError:
+                pass
+        raise
 
 
 def run_prep(args, cfg, key, source_dir, media_dir, config_path, state_dir=None):
@@ -820,6 +839,7 @@ def prep_loop(args, cfg, key, source_dir, media_dir, status):
             mtime, size = int(st.st_mtime), st.st_size
             if decided.get(rel) == (mtime, size) or pending.get(rel, ())[:2] == (mtime, size):
                 continue
+            pending.pop(rel, None)  # it changed since it was queued: look at it afresh
             out_dir = os.path.join(media_dir, iid)
             m = read_manifest(os.path.join(out_dir, "manifest.json"))
             fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime

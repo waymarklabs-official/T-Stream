@@ -70,7 +70,8 @@
 
   function loadCatalog() {
     return TStream.getJSON('media/catalog.json?t=' + Date.now()).then(function (c) {
-      var changed = !catalog || catalog.generated !== c.generated;
+      // compare the contents: two rebuilds within a second share "generated"
+      var changed = !catalog || JSON.stringify(catalog.categories) !== JSON.stringify(c.categories);
       catalog = c;
       if (changed) buildHome();
       if (!hasItems(c)) retryCatalog(10000);

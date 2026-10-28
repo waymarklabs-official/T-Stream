@@ -173,20 +173,14 @@ systemctl enable --now canvas-prep.timer >/dev/null 2>&1 || warn "could not enab
 
 # ------------------------------------------------------- add-videos page ---
 step "Add-videos page: send YouTube links and phone videos to the toy (http://<pi>/add/)"
-if [ -d "$ROOT/yt-dlp" ] && [ "$(stat -c %U "$ROOT/yt-dlp")" != "$OWNER" ]; then
-  chown -R "$OWNER": "$ROOT/yt-dlp"
+# Files in state/ are the owner's (the service runs as the owner), so they are
+# written as the owner: root writing there could be tricked by a symlink.
+as_owner() { runuser -u "$OWNER" -- "$@"; }
+as_owner mkdir -p "$ROOT/state/home" "$ROOT/state/cache"
+if ! grep -qE '^[0-9]{4,12}$' "$ROOT/state/add-pin.txt" 2>/dev/null; then
+  as_owner sh -c 'umask 077; python3 -c "import secrets; print(\"%08d\" % secrets.randbelow(10**8))" > "$1"' \
+    sh "$ROOT/state/add-pin.txt"
 fi
-if ! out=$(timeout 900 "$ROOT/bin/yt-dlp-update.sh" 2>&1); then
-  echo "$out" | tail -5
-  warn "Could not install the YouTube downloader (no internet?). The page works for phone videos; run tstream update later for YouTube."
-else
-  echo "$out" | tail -1
-fi
-case "$(dpkg --print-architecture 2>/dev/null)" in
-  armhf|armel)
-    warn "This is the 32-bit Raspberry Pi OS: YouTube downloads lack the Deno helper, and made-for-kids videos may fail."
-    warn "The 64-bit Raspberry Pi OS fixes that (it needs a fresh install of the SD card)." ;;
-esac
 cat > /etc/systemd/system/tstream-add.service <<UNIT
 [Unit]
 Description=T-Stream: add-videos page for your phone (/add/)
@@ -200,27 +194,54 @@ Restart=on-failure
 RestartSec=5
 # prep, started from here for new videos, converts in the background
 Nice=5
+# It downloads from the internet and runs yt-dlp, Deno and FFmpeg on what it
+# gets, so it may only write where videos and its own state live.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=$ROOT
+ReadWritePaths=$ROOT/source $ROOT/site/media $ROOT/state $ROOT/yt-dlp -$ROOT/prep.log
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-sudo -u "$OWNER" mkdir -p "$ROOT/state/home" "$ROOT/state/cache"
-if ! grep -qE '^[0-9]{4,12}$' "$ROOT/state/add-pin.txt" 2>/dev/null; then
-  (umask 077; python3 -c 'import secrets; print("%06d" % secrets.randbelow(10**6))' > "$ROOT/state/add-pin.txt")
-  chown "$OWNER": "$ROOT/state/add-pin.txt"
+mkdir -p "$ROOT/yt-dlp"   # $ROOT is root's, so the owner can't make it
+if [ "$(stat -c %U "$ROOT/yt-dlp")" != "$OWNER" ]; then
+  chown -R "$OWNER": "$ROOT/yt-dlp"
 fi
 systemctl daemon-reload
 systemctl enable tstream-add.service >/dev/null 2>&1 || true
 systemctl restart tstream-add.service || warn "the add-videos page did not start (journalctl -u tstream-add)"
+
+echo "Installing the YouTube downloader (yt-dlp)..."
+if ! out=$(timeout 900 "$ROOT/bin/yt-dlp-update.sh" 2>&1); then
+  echo "$out" | tail -5
+  warn "Could not install the YouTube downloader (no internet?). The page works for phone videos; run tstream update later for YouTube."
+else
+  echo "$out" | tail -1
+fi
+case "$(dpkg --print-architecture 2>/dev/null)" in
+  armhf|armel)
+    warn "This is the 32-bit Raspberry Pi OS: YouTube downloads lack the Deno helper, and made-for-kids videos may fail."
+    warn "The 64-bit Raspberry Pi OS fixes that (it needs a fresh install of the SD card)." ;;
+esac
 # The https address for the phone over Tailscale (needed to share straight
 # from the YouTube app on Android); only private to your Tailscale devices.
-if command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | grep -q '"BackendState": *"Running"'; then
-  "$ROOT/bin/remote-on.sh" --add-page || true
+if command -v tailscale >/dev/null; then
+  ts=$(tailscale status --json --peers=false 2>/dev/null || true)
+  if grep -q '"BackendState": *"Running"' <<<"$ts"; then
+    "$ROOT/bin/remote-on.sh" --add-page || true
+  fi
 fi
 
 # -------------------------------------------------------- Wi-Fi safety net ---

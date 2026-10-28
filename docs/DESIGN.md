@@ -86,23 +86,36 @@ the format blocks this.
 A small Python service (standard library only) on `127.0.0.1:8098`, run as
 the library owner by `tstream-add.service`. Caddy forwards `/add/*` to it from
 the `http://` and `https://` sites only, after checking that the client is on
-a private, hotspot, Tailscale or loopback address. The `:8099` site that
+a private, hotspot, Tailscale or loopback address, and refuses anything
+carrying Tailscale's `Tailscale-Funnel-Request` header. The `:8099` site that
 Tailscale Funnel puts on the internet does not import that route, and
 `e2e-add` checks that `/add/` and `/k/<key>/add/` are 404 there. The page's
 files live in `$ROOT/add/`, not in `site/`, so the Funnel link can't serve
-them either.
+them either. The service checks the address again (a global IPv6 address
+must be in the Pi's own /64), and the Host name: an IP address, the Pi's
+name with a home-network suffix (`.local`, `.lan`, ...), or its ts.net name.
+So a web page elsewhere can't aim its own domain at the Pi (DNS rebinding).
 
-- **Access:** a 6-digit PIN (`state/add-pin.txt`), 5 tries per address per
-  5 minutes and 50 per hour overall. A correct PIN gives the phone a one-year
-  HttpOnly cookie. API calls must carry an `X-TStream` header, so other web
-  sites can't use the cookie. iPhone Shortcuts send a key (`X-TStream-Key`)
-  made on the page. `tstream new-pin` empties `state/add-sessions.json`,
-  which ends every cookie and key.
+- **Access:** an 8-digit PIN (`state/add-pin.txt`). Wrong PINs are limited
+  to 5 per address per 5 minutes and 100 in all for one PIN; after that only
+  `tstream new-pin` helps. That caps a guesser's chance at 1 in a million.
+  The count lives in `state/add-pin-fails.json`, and `tstream` shows it.
+  - A correct PIN gives the phone a one-year HttpOnly cookie.
+  - API calls must carry an `X-TStream` header, so other web sites can't use
+    the cookie.
+  - iPhone Shortcuts send a key made on the page as
+    `Authorization: Bearer <key>`, a header Caddy leaves out of its log.
+  - `tstream new-pin` empties `state/add-sessions.json`, which ends every
+    cookie and key. It writes as the owner, like everything that touches
+    `state/`, so root never follows a link planted there.
+- **The service** is sandboxed by systemd: it may write only `source/`,
+  `site/media/`, `state/`, `yt-dlp/` and `prep.log`. It handles at most 24
+  requests at a time and 10 minutes per request.
 - **Uploads** go in 8 MB pieces (`PUT .../upload/<id>?offset=N`) into
   `source/.incoming/<id>.part`. prep never looks in dot folders. Each piece is
   fsynced, and one that is cut off is truncated back, so the file is always
   whole up to its offset. A wrong offset gets 409 with the right one. The id
-  comes from category + name + size + lastModified, so picking the same file
+  comes from name + size + lastModified, so picking the same file
   after a reload resumes it.
 - **Finished files** are hard-linked to `source/<Category>/<Title>.<ext>`.
   Linking never overwrites; ` (2)` is added when the name is taken. If the

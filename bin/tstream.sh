@@ -6,13 +6,17 @@
 ROOT=${CANVAS_ROOT:-/srv/canvas-player}
 
 if [ "${1:-}" = new-pin ]; then
+  [ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
   owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
-  if [ "$(id -un)" != "$owner" ] && [ "$(id -u)" -ne 0 ]; then
-    exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
+  pin=$(python3 -c 'import secrets; print("%08d" % secrets.randbelow(10**8))')
+  # written as the owner: state/ is the owner's, and root following a link
+  # planted there would write wherever it points
+  if ! runuser -u "$owner" -- sh -c 'umask 077; echo "$1" > "$2" && echo "{}" > "$3"' \
+      sh "$pin" "$ROOT/state/add-pin.txt" "$ROOT/state/add-sessions.json"; then
+    echo "Could not save a new PIN in $ROOT/state (the old one still works)."
+    exit 1
   fi
-  pin=$(python3 -c 'import secrets; print("%06d" % secrets.randbelow(10**6))')
-  (umask 077; echo "$pin" > "$ROOT/state/add-pin.txt"; echo '{}' > "$ROOT/state/add-sessions.json")
-  [ "$(id -u)" -ne 0 ] || chown "$owner": "$ROOT/state/add-pin.txt" "$ROOT/state/add-sessions.json"
+  systemctl try-restart tstream-add.service 2>/dev/null || true
   echo "New PIN for the add-videos page: $pin"
   echo "Every phone and iPhone Shortcut has to log in again (Shortcuts: make a new key on the page)."
   exit 0
@@ -89,12 +93,27 @@ try:
 except (OSError, ValueError):
     pass
 line = "%.1f GB free" % (free / 1e9)
+try:  # a prep stopped by a power cut never said it stopped
+    os.kill(int(st.get("pid")), 0)
+except ProcessLookupError:
+    st["running"] = False
+except (PermissionError, TypeError, ValueError):
+    pass
 if st.get("running") and st.get("current"):
     c = st["current"]
     line += "; converting %s (%d%%), %d waiting" % (c.get("path"), c.get("pct", 0), len(st.get("pending") or []))
 failed = [k for k, v in (st.get("failed") or {}).items() if not v.get("retry")]
 if failed:
     line += "; %d file(s) could not be converted (see prep.log)" % len(failed)
+if st.get("error") and not st.get("running"):
+    line += "; converting can't start: %s" % st["error"]
+try:
+    f = json.load(open(os.path.join(root, "state", "add-pin-fails.json")))
+    fails = f.get("count", 0) if f.get("pin") == os.stat(os.path.join(root, "state", "add-pin.txt")).st_mtime else 0
+    if fails:
+        line += "\n  %-14s %d wrong PIN(s) tried on the add-videos page since the PIN was made" % ("", fails)
+except (OSError, ValueError):
+    pass
 print("  \033[32m%-14s\033[0m %s" % ("space", line))
 PYEOF2
 if [ -r "$ROOT/remote-url.txt" ]; then

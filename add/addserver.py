@@ -28,6 +28,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -45,7 +46,11 @@ HOTSPOT_UPLOAD_BYTES_PER_S = 3 * 1024 * 1024  # leave the hotspot's radio for th
 SESSION_DAYS = 365
 LOGIN_TRIES = 5                    # wrong PINs per address ...
 LOGIN_WINDOW = 300                 # ... per 5 minutes
-LOGIN_TRIES_ALL = 50               # wrong PINs from everyone per hour
+LOGIN_TRIES_PIN = 100              # wrong PINs in all, then only `tstream new-pin` helps
+MAX_REQUESTS = 24                  # requests handled at once (slow clients can't use up the Pi)
+REQUEST_SECONDS = 600              # longest a request may take (an 8 MB piece on a slow link)
+DOWNLOAD_STALL_SECONDS = 600       # yt-dlp printed nothing for this long: stop it
+DOWNLOAD_MAX_SECONDS = 3 * 3600
 YTDLP_UPDATE_HOURS = 24            # YouTube changes often; yt-dlp keeps up
 PLAYLIST_CHECK_MINUTES = 60
 PLAYLIST_MAX = 300                 # videos added from one playlist at once
@@ -67,6 +72,11 @@ STATIC = {
 }
 
 YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# Names a phone may use for the Pi besides its IP addresses (router DNS
+# suffixes can't be registered on the internet, so no other web site can
+# take them over; see Handler.host_ok)
+LOCAL_SUFFIXES = ("", ".local", ".lan", ".home", ".localdomain", ".home.arpa", ".fritz.box", ".internal")
 
 
 def log(msg):
@@ -112,7 +122,7 @@ def clean_name(s, limit=120):
     s = re.sub(r"\s*[:|]+\s*", " - ", s)  # "Show: Episode | Channel" -> "Show - Episode - Channel"
     s = re.sub(r'[*?"<>]+', "", s.replace('"', "'"))
     s = s.rstrip(". ")  # Windows-style file systems drop trailing dots
-    s = re.sub(r"\s+", " ", s).strip().lstrip(".").strip()
+    s = re.sub(r"\s+", " ", s).lstrip(". ").strip()  # a leading dot would hide it from prep
     while len(s.encode("utf-8")) > limit:
         s = s[:-1]
     return s.strip()
@@ -221,8 +231,10 @@ class App:
         self.dl_proc = None
         self.dl_job = None
         self.fail_ip = {}
-        self.fail_all = []
+        self.pin_mtime = None
         self.sizes = (0, None)
+        self.ytdlp_lock = threading.RLock()  # one yt-dlp (or its update) at a time
+        self.prep_quick_fails = 0
 
         self.jobs_path = os.path.join(self.state, "add-jobs.json")
         self.sess_path = os.path.join(self.state, "add-sessions.json")
@@ -230,6 +242,7 @@ class App:
         self.lists_path = os.path.join(self.state, "add-playlists.json")
         self.ledger_path = os.path.join(self.state, "add-ledger.json")
         self.prefs_path = os.path.join(self.state, "add-prefs.json")
+        self.fails_path = os.path.join(self.state, "add-pin-fails.json")
         self.jobs = read_json(self.jobs_path, {})
         self.playlists = read_json(self.lists_path, {})
         self.ledger = read_json(self.ledger_path, {})   # "youtube:<id>" -> {"rel", "at"}
@@ -253,7 +266,10 @@ class App:
             write_json(path, data, mode)
 
     def config(self):
-        return self.prep.load_config(self.cfg_path if os.path.exists(self.cfg_path) else None)
+        try:
+            return self.prep.load_config(self.cfg_path if os.path.exists(self.cfg_path) else None)
+        except SystemExit as e:  # load_config's way of saying "bad config.json"
+            raise RuntimeError("config.json: %s" % e)
 
     # ------------------------------------------------------------- auth ---
     def pin(self):
@@ -264,7 +280,7 @@ class App:
                 return p
         except OSError:
             pass
-        p = "%06d" % secrets.randbelow(10 ** 6)
+        p = "%08d" % secrets.randbelow(10 ** 8)
         fd = os.open(self.pin_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(p + "\n")
@@ -308,22 +324,41 @@ class App:
                 self.save_sessions()
 
     def login(self, ip, pin):
+        """Wrong PINs: 5 per address per 5 minutes, and 100 in all for one
+        PIN; after that only a new PIN (`tstream new-pin`) opens the page."""
         t = time.time()
         with self.lock:
-            tries = self.fail_ip[ip] = [x for x in self.fail_ip.get(ip, []) if t - x < LOGIN_WINDOW]
-            self.fail_all = [x for x in self.fail_all if t - x < 3600]
+            right = self.pin()
+            mt = os.stat(self.pin_path).st_mtime
+            if mt != self.pin_mtime:  # a new PIN: nobody is waiting any more
+                self.pin_mtime, self.fail_ip = mt, {}
+            fails = read_json(self.fails_path, {})
+            if fails.get("pin") != mt:
+                fails = {"pin": mt, "count": 0}
+            if fails["count"] >= LOGIN_TRIES_PIN:
+                raise Http(429, "Too many wrong PINs were tried. On the Pi run: tstream new-pin")
+            for k in [k for k, v in self.fail_ip.items() if not v or t - v[-1] > LOGIN_WINDOW]:
+                del self.fail_ip[k]
+            tries = [x for x in self.fail_ip.get(ip, []) if t - x < LOGIN_WINDOW]
             if len(tries) >= LOGIN_TRIES:
                 raise Http(429, "Too many wrong PINs. Wait %d minutes, then try again."
                            % max(1, round((LOGIN_WINDOW - (t - tries[0])) / 60)))
-            if len(self.fail_all) >= LOGIN_TRIES_ALL:
-                raise Http(429, "Too many wrong PINs on this network. Try again in an hour, or make a new PIN on "
-                           "the Pi: tstream new-pin")
-            if not secrets.compare_digest(str(pin).strip(), self.pin()):
-                tries.append(t)
-                self.fail_all.append(t)
+            if not secrets.compare_digest(str(pin).strip().encode(), right.encode()):
+                self.fail_ip[ip] = tries + [t]
+                fails["count"] += 1
+                write_json(self.fails_path, fails, 0o600)
+                log("wrong PIN from %s (%d since this PIN was made)" % (ip, fails["count"]))
                 raise Http(403, "Wrong PIN. It is shown on the Pi by the command: tstream")
             self.fail_ip.pop(ip, None)
         return self.new_session("browser")
+
+    def https_host(self):
+        """<pi>.<tailnet>.ts.net when remote-on / install set up the https page."""
+        try:
+            with open(os.path.join(self.state, "add-https-url.txt")) as f:
+                return urllib.parse.urlsplit(f.read().strip()).hostname
+        except (OSError, ValueError):
+            return None
 
     # ------------------------------------------------------------ space ---
     def space(self):
@@ -357,7 +392,8 @@ class App:
         would not fit next to everything already arriving."""
         with self.lock:
             arriving = sum(max(0, (j.get("size") or 0) - (j.get("offset") or 0))
-                           for j in self.jobs.values() if j["state"] == "uploading")
+                           for j in self.jobs.values() if j["state"] == "uploading"
+                           and time.time() - j.get("updated", j["created"]) < 3600)
         need = size + arriving + self.prep.space_needed(self.config(), duration, size)
         free = shutil.disk_usage(self.media).free
         if free < need:
@@ -395,18 +431,25 @@ class App:
                 self.save_jobs()
 
     def cleanup_incoming(self):
+        """Abandoned uploads and leftovers in source/.incoming (at start, then hourly)."""
         keep = set()
         t = time.time()
-        for j in self.jobs.values():
-            if j["state"] == "uploading":
-                if t - j.get("updated", j["created"]) > ABANDONED_UPLOAD_DAYS * 86400:
-                    j.update(state="failed", error="Upload was not finished.")
-                else:
-                    keep.add(j["id"] + ".part")
+        with self.lock:
+            for j in self.jobs.values():
+                if j["state"] == "uploading":
+                    if t - j.get("updated", j["created"]) > ABANDONED_UPLOAD_DAYS * 86400:
+                        j.update(state="failed", error="This upload was not finished.")
+                    else:
+                        keep.add(j["id"] + ".part")
+            busy = self.dl_job
         for fn in os.listdir(self.incoming):
-            if fn not in keep and not fn.startswith("."):
-                p = os.path.join(self.incoming, fn)
+            if fn in keep or fn.startswith(".") or (busy and fn.startswith("yt-%s." % busy)):
+                continue
+            p = os.path.join(self.incoming, fn)
+            try:
                 shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+            except OSError:
+                pass
 
     def categories(self):
         names = set()
@@ -439,14 +482,19 @@ class App:
                 break
             except FileExistsError:
                 n += 1
-            except OSError:  # no hard links on this drive: claim the name, then move
-                try:
+            except OSError as e:
+                if e.errno not in (errno.EPERM, errno.EXDEV, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOTSUP):
+                    raise
+                try:  # no hard links on this drive (FAT/exFAT): claim the name, then move
                     os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
                 except FileExistsError:
                     n += 1
                     continue
-                shutil.copymode(tmp, dest)
-                os.replace(tmp, dest)
+                try:
+                    os.replace(tmp, dest)
+                except OSError:
+                    os.remove(dest)
+                    raise
                 break
         # newest first in prep's queue, and past its "still copying?" wait
         t = time.time() - 61
@@ -464,12 +512,21 @@ class App:
         return rel
 
     def prep_status(self):
-        return read_json(os.path.join(self.state, "prep-status.json"), {})
+        st = read_json(os.path.join(self.state, "prep-status.json"), {})
+        if st.get("running"):
+            try:
+                os.kill(int(st.get("pid")), 0)
+            except ProcessLookupError:  # killed without cleaning up
+                st.update(running=False, current=None)
+            except (PermissionError, TypeError, ValueError):
+                pass
+        return st
 
     def view(self, j, st):
         """A job as the page shows it, with conversion progress from prep."""
         v = {k: j.get(k) for k in ("id", "kind", "state", "title", "category", "pct", "error", "url",
                                    "size", "offset", "created", "name", "lastModified", "added", "watch")}
+        v["canRetry"] = j["state"] in ("failed", "cancelled") and j["kind"] in ("link", "playlist")
         if j["state"] != "placed":
             return v
         rel = j["rel"].replace(os.sep, "/")
@@ -486,9 +543,11 @@ class App:
         if st.get("running") and cur.get("path") == rel:
             v.update(state="converting", pct=cur.get("pct", 0))
         elif f and f.get("mtime") == j["mtime"] and f.get("size") == j["srcSize"]:
-            v.update(state="failed", error="Could not convert: " + str(f.get("error", ""))[-300:])
+            v.update(state="failed", error="Could not convert: " + str(f.get("error", ""))[-300:], canRetry=True)
         else:
             v.update(state="waiting", pct=0)
+            if st.get("error") and not st.get("running"):  # prep can't start at all
+                v["error"] = "Converting can't start: %s" % st["error"]
         return v
 
     def state_view(self):
@@ -525,24 +584,38 @@ class App:
         """Starts prep whenever a placed video waits and no prep is running
         (prep looks for new files after each video, so a running one picks
         new arrivals up by itself)."""
-        last = 0
+        last = cleaned = 0
         while True:
             kicked = self.wake_prep.wait(20)
             self.wake_prep.clear()
-            if self.prep_proc and self.prep_proc.poll() is not None:
-                self.prep_proc = None
-            if self.prep_proc or (not kicked and time.time() - last < 60):
-                continue
-            if not self.waiting_jobs() or self.prep_running():
-                continue
-            last = time.time()
-            logf = open(os.path.join(self.root, "prep.log"), "a")
-            cmd = [sys.executable, "-u", self.prep_py, "--root", self.root, "--no-wait"]
-            if shutil.which("nice"):
-                cmd = ["nice", "-n", "10"] + cmd
-            log("starting prep")
-            self.prep_proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-            logf.close()
+            try:
+                if time.time() - cleaned > 3600:
+                    cleaned = time.time()
+                    self.cleanup_incoming()
+                if self.prep_proc and self.prep_proc.poll() is not None:
+                    # it could not start at all (it says why in its status), not "a file failed"
+                    quick = self.prep_proc.returncode != 0 and bool(self.prep_status().get("error"))
+                    self.prep_quick_fails = self.prep_quick_fails + 1 if quick else 0
+                    self.prep_proc = None
+                wait = 60 * 2 ** min(self.prep_quick_fails, 6)  # prep that can't start: back off up to an hour
+                if self.prep_proc or ((not kicked or self.prep_quick_fails) and time.time() - last < wait):
+                    continue
+                if not self.waiting_jobs() or self.prep_running():
+                    continue
+                last = time.time()
+                try:
+                    logf = open(os.path.join(self.root, "prep.log"), "a")
+                except OSError:
+                    logf = open(os.devnull, "w")
+                cmd = [sys.executable, "-u", self.prep_py, "--root", self.root, "--no-wait"]
+                if shutil.which("nice"):
+                    cmd = ["nice", "-n", "10"] + cmd
+                log("starting prep")
+                self.prep_proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                                  stdin=subprocess.DEVNULL)
+                logf.close()
+            except Exception as e:  # never let this thread die
+                log("prep loop: %r" % e)
 
     # ---------------------------------------------------------- removal ---
     def library(self):
@@ -562,11 +635,15 @@ class App:
         if not m:
             raise Http(404, "That video is not on the toy any more.")
         rel = (m.get("source") or {}).get("path") or ""
-        src = os.path.realpath(os.path.join(self.source, rel))
         gone = False
-        if rel and src.startswith(os.path.realpath(self.source) + os.sep) and os.path.isfile(src):
-            os.remove(src)
-            gone = True
+        for path, srel, _ in self.prep.scan_sources(self.source):
+            if self.prep.item_id(srel) == iid:
+                try:
+                    os.remove(path)
+                    gone = True
+                except OSError as e:
+                    raise Http(500, "Could not delete its file on the Pi (%s), so it would come back. "
+                               "Delete %s by hand." % (e.strerror, self.prep.readable(path)))
         # the files stay a few minutes (the toy may be playing it); prep deletes them
         with open(os.path.join(item, self.prep.REMOVED), "w") as f:
             f.write(now_iso() + "\n")
@@ -600,35 +677,68 @@ class App:
             raise Http(400, "This file is empty.")
         category = self.pick_category(d.get("category"))
         title = clean_name(d.get("title")) or self.prep.clean_title(os.path.splitext(name)[0])
-        # the same file picked again (after a reload) continues where it stopped
-        jid = "up" + hashlib.sha1(("%s|%s|%d|%d" % (category, name, size, lm)).encode()).hexdigest()[:10]
-        with self.lock:
-            j = self.jobs.get(jid)
-            if j and j["state"] == "uploading":
-                part = os.path.join(self.incoming, jid + ".part")
-                off = os.path.getsize(part) if os.path.exists(part) else 0
-                self.update(j, offset=off, title=title)
-                return {"id": jid, "offset": off}
-            if j and j["state"] == "placed" and self.view(j, self.prep_status())["state"] in ("ready", "waiting",
-                                                                                                "converting"):
-                return {"id": jid, "offset": size, "already": True}
-        try:
-            duration = float(d.get("duration")) if d.get("duration") else None
-        except (TypeError, ValueError):
-            duration = None
-        self.need_space(size, duration)
-        open(os.path.join(self.incoming, jid + ".part"), "wb").close()
-        self.new_job("upload", id=jid, state="uploading", name=name, size=size, offset=0, lastModified=lm,
-                     category=category, title=title, ext=ext)
-        return {"id": jid, "offset": 0}
-
-    def upload_piece(self, jid, offset, body_reader, length, throttle):
-        with self.lock:
-            j = self.jobs.get(jid)
-            if not j or j["state"] != "uploading":
-                raise Http(404, "This upload is no longer waiting. Pick the file again.")
+        # The same file picked again (after a reload, or under another
+        # category) continues where it stopped.
+        jid = "up" + hashlib.sha1(("%s|%d|%d" % (name, size, lm)).encode()).hexdigest()[:10]
         part = os.path.join(self.incoming, jid + ".part")
         with _part_lock(jid):
+            with self.lock:
+                j = self.jobs.get(jid)
+                state = j and j["state"]
+                if state == "uploading":
+                    off = os.path.getsize(part) if os.path.exists(part) else 0
+                    self.update(j, offset=off, title=title, category=category)
+                    if off < size:
+                        return {"id": jid, "offset": off}
+                elif state == "placed":
+                    v = self.view(j, self.prep_status())["state"]
+                    if v == "failed":  # converting failed: try once more with the file we have
+                        self.retry(jid)
+                        return {"id": jid, "offset": size, "done": True}
+                    if v in ("ready", "waiting", "converting"):
+                        return {"id": jid, "offset": size, "done": True, "already": v == "ready"}
+            if state == "uploading":  # all there; only saving it was missing
+                return self.finish_upload(j)
+            try:
+                duration = float(d.get("duration")) if d.get("duration") else None
+            except (TypeError, ValueError):
+                duration = None
+            self.need_space(size, duration)
+            open(part, "wb").close()
+            self.new_job("upload", id=jid, state="uploading", name=name, size=size, offset=0, lastModified=lm,
+                         category=category, title=title, ext=ext)
+        return {"id": jid, "offset": 0}
+
+    def finish_upload(self, j):
+        """Moves a complete upload into source/ (called with its piece lock held)."""
+        part = os.path.join(self.incoming, j["id"] + ".part")
+        with self.lock:
+            cancelled = j["state"] != "uploading"
+        if cancelled:
+            if os.path.exists(part):
+                os.remove(part)
+            raise Http(410, "This upload was cancelled.")
+        try:
+            self.place(part, j["category"], j["title"], j["ext"], j)
+        except Exception as e:
+            log("could not place %s: %r" % (j["id"], e))
+            self.update(j, state="failed", error="The Pi could not save this video: %s" % (
+                getattr(e, "strerror", None) or e))
+            raise Http(500, j["error"])
+        return {"id": j["id"], "offset": j["size"], "done": True}
+
+    def upload_piece(self, jid, offset, body_reader, length, throttle):
+        part = os.path.join(self.incoming, jid + ".part")
+        with _part_lock(jid):
+            with self.lock:
+                j = self.jobs.get(jid)
+                state = j and j["state"]
+            if state == "placed":  # this was its last piece; the first answer got lost
+                return {"offset": j["size"], "done": True}
+            if state != "uploading":
+                raise Http(410 if state == "cancelled" else 404,
+                           "This upload was cancelled." if state == "cancelled"
+                           else "This upload is no longer waiting. Pick the file again.")
             have = os.path.getsize(part) if os.path.exists(part) else 0
             if offset != have:
                 raise Http(409, "offset mismatch", offset=have)
@@ -651,10 +761,11 @@ class App:
                 if got != length:
                     raise ConnectionError("short piece")
             except BaseException as e:
-                with open(part, "r+b") as f:  # never keep half a piece
-                    f.truncate(have)
+                if os.path.exists(part):
+                    with open(part, "r+b") as f:  # never keep half a piece
+                        f.truncate(have)
                 if isinstance(e, OSError) and e.errno == errno.ENOSPC:
-                    raise Http(507, "The Pi's memory card is full.")
+                    raise Http(507, "The Pi's memory card is full. Remove some videos from the toy first.")
                 raise
             off = have + got
             if off < j["size"]:
@@ -662,8 +773,7 @@ class App:
                             pct=int(off * 100 / j["size"]))
                 return {"offset": off}
             self.update(j, offset=off, pct=100)
-            self.place(part, j["category"], j["title"], j["ext"], j)
-            return {"offset": off, "done": True}
+            return self.finish_upload(j)
 
     # ---------------------------------------------------------- youtube ---
     def ytdlp_cmd(self):
@@ -681,23 +791,29 @@ class App:
 
     def ytdlp_update(self, force=False):
         stamp = os.path.join(self.state, "yt-dlp-updated")
-        try:
-            if not force and time.time() - os.stat(stamp).st_mtime < YTDLP_UPDATE_HOURS * 3600:
-                return
-        except OSError:
-            pass
         updater = os.path.join(self.root, "bin", "yt-dlp-update.sh")
-        if not os.access(updater, os.X_OK):
-            return
-        log("updating yt-dlp")
-        try:
-            p = subprocess.run([updater], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600,
-                               env=self.ytdlp_env(), encoding="utf-8", errors="replace")
-            log("yt-dlp update: %s" % (p.stdout.strip().splitlines() or ["done"])[-1])
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log("yt-dlp update failed: %s" % e)
-        with open(stamp, "w"):
-            pass
+        with self.ytdlp_lock:
+            try:
+                if not force and time.time() - os.stat(stamp).st_mtime < YTDLP_UPDATE_HOURS * 3600:
+                    return
+            except OSError:
+                pass
+            if not os.access(updater, os.X_OK):
+                return
+            log("updating yt-dlp")
+            ok = False
+            try:
+                p = subprocess.run([updater], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900,
+                                   env=self.ytdlp_env(), encoding="utf-8", errors="replace")
+                ok = p.returncode == 0
+                log("yt-dlp update: %s" % (p.stdout.strip().splitlines() or ["done"])[-1])
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log("yt-dlp update failed: %s" % e)
+            with open(stamp, "w"):
+                pass
+            if not ok:  # no internet, maybe: try again in an hour, not in a day
+                t = time.time() - (YTDLP_UPDATE_HOURS - 1) * 3600
+                os.utime(stamp, (t, t))
 
     def add_link(self, d):
         url = find_url(d.get("url") or d.get("text"))
@@ -715,9 +831,20 @@ class App:
             return {"id": j["id"], "message": "Reading the playlist..."}
         if vid:
             url = "https://www.youtube.com/watch?v=" + vid
-            dup = self.duplicate("youtube:" + vid)
+            key = "youtube:" + vid
+            with self.lock:
+                st = self.prep_status()
+                old = next((x for x in self.jobs.values() if x.get("key") == key and x["state"] == "placed"
+                            and self.view(x, st)["state"] == "failed"), None)
+            if old:
+                self.retry(old["id"])
+                return {"id": old["id"], "message": "Trying again: %s" % old.get("title")}
+            dup = self.duplicate(key)
             if dup:
                 return {"message": dup, "already": True}
+            with self.lock:
+                if self.ledger.get(key, {}).pop("skip", None):
+                    self.save(self.ledger_path, self.ledger)
         self.need_space(0, 600)  # a 10-minute video; checked again once its length is known
         j = self.new_job("link", url=url, key="youtube:" + vid if vid else None, category=category,
                          title=title or None, wantTitle=bool(title))
@@ -730,22 +857,25 @@ class App:
             for j in self.jobs.values():
                 if j.get("key") == key and j["state"] in ("queued", "downloading") and j["id"] != but:
                     return "Already in the queue: %s" % (j.get("title") or j.get("url"))
-            e = self.ledger.get(key)
-        if e and not e.get("removed") and os.path.exists(os.path.join(self.source, e["rel"])):
+            e = self.ledger.get(key) or {}
+        if e.get("rel") and not e.get("removed") and os.path.exists(os.path.join(self.source, e["rel"])):
             return "Already on the toy: %s" % os.path.splitext(os.path.basename(e["rel"]))[0]
         return None
 
     def run_ytdlp(self, args, timeout=None):
-        cmd = self.ytdlp_cmd() + args
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                              env=self.ytdlp_env(), encoding="utf-8", errors="replace")
+        with self.ytdlp_lock:
+            cmd = self.ytdlp_cmd() + args
+            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                                  env=self.ytdlp_env(), encoding="utf-8", errors="replace")
 
     def read_playlist(self, j):
         self.update(j, state="downloading", pct=0, error=None)
         try:
-            added, title = self.check_playlist(j["url"], j["category"])
+            added, title = self.check_playlist(j["url"], j["category"], j)
         except Http as e:
             return self.update(j, state="failed", error=str(e))
+        if j["state"] == "cancelled":
+            return
         if j.get("watch"):
             with self.lock:
                 self.playlists[j["list"]] = {"url": j["url"], "title": title, "category": j["category"],
@@ -753,10 +883,13 @@ class App:
                 self.save(self.lists_path, self.playlists)
         self.update(j, state="listed", title=title, added=added)
 
-    def check_playlist(self, url, category):
+    def check_playlist(self, url, category, job=None):
         self.ytdlp_update()
-        p = self.run_ytdlp(["--ignore-config", "--flat-playlist", "-J", "--no-warnings",
-                            "--cache-dir", os.path.join(self.state, "yt-dlp-cache"), url], timeout=300)
+        try:
+            p = self.run_ytdlp(["--ignore-config", "--flat-playlist", "-J", "--no-warnings",
+                                "--cache-dir", os.path.join(self.state, "yt-dlp-cache"), "--", url], timeout=300)
+        except subprocess.TimeoutExpired:
+            raise Http(504, "Reading the playlist took too long.")
         if p.returncode != 0:
             raise Http(502, friendly_error(p.stderr))
         try:
@@ -765,6 +898,8 @@ class App:
             raise Http(502, "The playlist could not be read.")
         title = clean_name(info.get("title")) or "Playlist"
         added = 0
+        if job and job["state"] == "cancelled":
+            return 0, title
         for e in (info.get("entries") or [])[:PLAYLIST_MAX]:
             vid = e.get("id")
             if not vid or not YT_ID.match(vid) or e.get("availability") in ("private", "needs_auth") \
@@ -772,7 +907,9 @@ class App:
                 continue
             key = "youtube:" + vid
             with self.lock:
-                if self.ledger.get(key, {}).get("removed"):  # removed from the toy on purpose
+                e = self.ledger.get(key, {})
+                # removed, cancelled or hidden on purpose, or already tried (see its job)
+                if e.get("removed") or e.get("skip") or any(x.get("key") == key for x in self.jobs.values()):
                     continue
             if self.duplicate(key):
                 continue
@@ -850,10 +987,20 @@ class App:
         self.update(j, state="failed", error=friendly_error(err))
 
     def download_once(self, j):
+        with self.ytdlp_lock:
+            return self._download_once(j)
+
+    def _download_once(self, j):
         out = os.path.join(self.incoming, "yt-%s.%%(ext)s" % j["id"])
+        # never more than fits (leaving room to convert an hour of video)
+        room = shutil.disk_usage(self.media).free - self.prep.space_needed(self.config(), 3600, 0)
+        cap = max(200 * 1000 * 1000, min(room, 8 * 10 ** 9))
         args = [
             "--ignore-config", "--no-playlist", "--no-simulate", "--no-mtime", "--no-colors",
             "--cache-dir", os.path.join(self.state, "yt-dlp-cache"),
+            # known video sites only: the "generic" extractor would fetch whatever a page points to
+            "--use-extractors", "default,-generic",
+            "--max-filesize", str(cap),
             "--match-filters", "!is_live & live_status!=is_upcoming",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
             ] + self.format_args() + [
@@ -871,8 +1018,23 @@ class App:
         self.dl_proc, self.dl_job = p, j["id"]
         path, info, done, total = None, {}, 0, 0
         last_save = 0
+        alive = [time.time(), None]
+
+        def watchdog():  # a download that hangs, or drips forever, must not block the queue
+            t0 = time.time()
+            while p.poll() is None:
+                if time.time() - alive[0] > DOWNLOAD_STALL_SECONDS:
+                    alive[1] = "ERROR: the download stopped making progress"
+                elif time.time() - t0 > DOWNLOAD_MAX_SECONDS:
+                    alive[1] = "ERROR: the download took too long"
+                if alive[1]:
+                    p.kill()
+                    return
+                time.sleep(5)
+        threading.Thread(target=watchdog, daemon=True).start()
         try:
             for line in p.stdout:
+                alive[0] = time.time()
                 if line.startswith("TSTREAM-INFO "):
                     try:
                         info = json.loads(line[13:])
@@ -904,6 +1066,10 @@ class App:
                     if status == "finished":
                         done += size or got
                         got = 0
+                    if done + got > cap:  # a stream with no size given can't be capped by yt-dlp
+                        alive[1] = "ERROR: this video is too big for the space left on the Pi"
+                        p.kill()
+                        break
                     whole = max(total, done + max(size, got), 1)
                     pct = min(99, int((done + got) * 100 / whole))
                     if pct != j["pct"]:
@@ -921,10 +1087,18 @@ class App:
             errf.close()
         if j["state"] != "downloading":
             return False, err
+        if alive[1]:
+            return False, alive[1]
+        if p.returncode == 0 and not path:
+            # --print hides yt-dlp's own notes: no info means the live/premiere
+            # filter refused it; info but no file, the size limit stopped it
+            return False, ("ERROR: this video is too big for the space left on the Pi" if info
+                           else "ERROR: is live")
         if p.returncode != 0 or not path or not os.path.isfile(path):
-            if p.returncode == 0 and "does not pass filter" in err:
-                return False, "ERROR: is live"
             return False, err or "yt-dlp stopped (exit %s)" % p.returncode
+        if os.path.dirname(os.path.abspath(path)) != os.path.abspath(self.incoming) \
+                or not os.path.basename(path).startswith("yt-%s." % j["id"]):
+            return False, "ERROR: yt-dlp saved the file somewhere unexpected"
         ext = os.path.splitext(path)[1].lower()
         if ext not in self.prep.VIDEO_EXTS:
             return False, "ERROR: the download is not a video file (%s)" % ext
@@ -942,31 +1116,68 @@ class App:
         h = int(self.config()["height"])
         return ["-f", "bv*+ba/b", "-S", "res:%d,vcodec:h264,acodec:aac" % h, "--merge-output-format", "mp4/mkv"]
 
+    def skip_key(self, j):
+        """A video cancelled or hidden on purpose: a watched playlist leaves it out."""
+        if j.get("key") and j["kind"] == "link":
+            self.ledger.setdefault(j["key"], {})["skip"] = True
+            self.save(self.ledger_path, self.ledger)
+
     def cancel(self, jid):
+        """Cancel for an active job, Hide for a finished one."""
         with self.lock:
             j = self.jobs.get(jid)
             if not j:
                 raise Http(404, "not found")
-            if j["state"] in ("queued", "downloading", "uploading"):
+            active = j["state"] in ("queued", "downloading", "uploading")
+            if active:
                 self.update(j, state="cancelled")
                 if self.dl_job == jid and self.dl_proc:
                     try:
                         self.dl_proc.send_signal(signal.SIGTERM)
                     except OSError:
                         pass
-                part = os.path.join(self.incoming, jid + ".part")
-                if os.path.exists(part):
-                    os.remove(part)
+            elif j["state"] == "placed" and self.view(j, self.prep_status())["state"] in ("waiting", "converting"):
+                raise Http(409, "It is being converted; remove it under \"On the toy\" once it is there.")
             else:
                 del self.jobs[jid]
                 self.save_jobs()
+            if j["state"] in ("cancelled", "failed"):
+                self.skip_key(j)
+        if active and j["kind"] == "upload":
+            lk = _part_lock(jid)
+            if lk.acquire(blocking=False):  # else the piece being written sees "cancelled"
+                try:
+                    part = os.path.join(self.incoming, jid + ".part")
+                    if os.path.exists(part):
+                        os.remove(part)
+                finally:
+                    lk.release()
         return {"ok": True}
 
     def retry(self, jid):
         with self.lock:
             j = self.jobs.get(jid)
-            if not j or j["state"] not in ("failed", "cancelled") or j["kind"] not in ("link", "playlist"):
+            if not j:
+                raise Http(404, "not found")
+            if j["state"] == "placed" and self.view(j, self.prep_status())["state"] == "failed":
+                src = os.path.join(self.source, j["rel"])
+                if j["kind"] == "link":  # the download was probably damaged: get it again
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
+                    self.update(j, state="queued", pct=0, error=None)
+                    self.wake_dl.set()
+                else:  # prep tries a file again once it changed
+                    t = time.time() - 61
+                    os.utime(src, (t, t))
+                    self.update(j, mtime=int(os.stat(src).st_mtime), error=None)
+                    self.wake_prep.set()
+                return {"ok": True}
+            if j["state"] not in ("failed", "cancelled") or j["kind"] not in ("link", "playlist"):
                 raise Http(400, "This can't be tried again; add it again instead.")
+            if j.get("key"):
+                self.ledger.get(j["key"], {}).pop("skip", None)
             self.update(j, state="queued", pct=0, error=None)
         self.wake_dl.set()
         return {"ok": True}
@@ -974,6 +1185,30 @@ class App:
 
 _part_locks = {}
 _part_locks_guard = threading.Lock()
+_request_slots = threading.BoundedSemaphore(MAX_REQUESTS)
+HOSTNAME = socket.gethostname().split(".")[0].lower()
+
+
+def own_ipv6_prefixes():
+    """The /64 networks of this Pi's global IPv6 addresses: a phone on the
+    same home network has a global address in one of them."""
+    nets = set()
+    try:
+        with open("/proc/net/if_inet6") as f:
+            for line in f:
+                h = line.split()[0]
+                a = ipaddress.ip_address(":".join(h[i:i + 4] for i in range(0, 32, 4)))
+                if a.is_global:
+                    nets.add(ipaddress.ip_network("%s/64" % a, strict=False))
+    except (OSError, ValueError, IndexError):
+        pass
+    return nets
+
+
+def local_client(ip):
+    if any(ip in n for n in PRIVATE_NETS):
+        return True
+    return ip.version == 6 and any(ip in n for n in own_ipv6_prefixes())
 
 
 def _part_lock(jid):
@@ -999,10 +1234,32 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
+    def host(self):
+        h = (self.headers.get("Host") or "").strip().lower()
+        if h.startswith("["):
+            return h[1:h.find("]")]
+        return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+    def host_ok(self):
+        """Only names that are this Pi, so a web page elsewhere can't point
+        its own domain at the Pi's address (DNS rebinding) and talk to us."""
+        h = self.host()
+        try:
+            ipaddress.ip_address(h)
+            return True
+        except ValueError:
+            pass
+        if h == "localhost" or h in (HOSTNAME + x for x in LOCAL_SUFFIXES):
+            return True
+        ts = self.app.https_host()
+        return h == ts if ts else h.endswith(".ts.net")
+
+    def shortcut(self):
+        return (self.headers.get("Authorization") or "").lower().startswith("bearer ")
+
     def token(self):
-        key = self.headers.get("X-TStream-Key")
-        if key:
-            return key.strip()
+        if self.shortcut():  # iPhone Shortcut key (Caddy leaves this header out of its log)
+            return self.headers["Authorization"][7:].strip()
         for part in (self.headers.get("Cookie") or "").split(";"):
             k, _, v = part.strip().partition("=")
             if k == "tsadd":
@@ -1018,11 +1275,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        if ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; "
+                             "media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def read(self, n):
+        if time.time() - self.started > REQUEST_SECONDS:
+            raise TimeoutError("request took too long")
+        return self.rfile.read(n)
 
     def body_reader(self, limit):
         """Yields the request body in blocks (Content-Length or chunked)."""
@@ -1033,7 +1299,12 @@ class Handler(BaseHTTPRequestHandler):
                     line = self.rfile.readline(1024)
                     if not line:
                         return
-                    n = int(line.split(b";")[0].strip() or b"0", 16)
+                    try:
+                        n = int(line.split(b";")[0].strip() or b"0", 16)
+                    except ValueError:
+                        raise Http(400, "bad request")
+                    if n < 0:
+                        raise Http(400, "bad request")
                     if n == 0:
                         while self.rfile.readline(1024).strip():
                             pass
@@ -1043,21 +1314,24 @@ class Handler(BaseHTTPRequestHandler):
                         raise Http(413, "piece too large")
                     left = n
                     while left:
-                        b = self.rfile.read(min(left, 1 << 20))
+                        b = self.read(min(left, 1 << 20))
                         if not b:
                             return
                         left -= len(b)
                         yield b
                     self.rfile.readline(1024)
             return chunks(), None
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > limit:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise Http(400, "bad request")
+        if n < 0 or n > limit:
             raise Http(413, "piece too large")
 
         def plain():
             left = n
             while left:
-                b = self.rfile.read(min(left, 1 << 20))
+                b = self.read(min(left, 1 << 20))
                 if not b:
                     return
                 left -= len(b)
@@ -1088,11 +1362,23 @@ class Handler(BaseHTTPRequestHandler):
         self.route("PUT")
 
     def route(self, method):
+        self.started = time.time()
+        if not _request_slots.acquire(blocking=False):
+            return self.send(503, {"error": "The Pi is busy; try again in a moment."})
+        try:
+            self.handle_request(method)
+        finally:
+            _request_slots.release()
+
+    def handle_request(self, method):
         app = self.app
         try:
             ip = self.client_ip()
-            if ip is None or not any(ip in n for n in PRIVATE_NETS):
+            if ip is None or not local_client(ip):
                 raise Http(403, "Only from your home network, the hotspot or Tailscale.")
+            if not self.host_ok():
+                raise Http(403, "Open this page with the Pi's address, like http://192.168.1.20/add/ "
+                           "(the command tstream on the Pi shows it).")
             u = urllib.parse.urlsplit(self.path)
             path = u.path
             if not path.startswith("/add/"):
@@ -1114,10 +1400,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(303, b"", "text/plain", [("Location", "/add/?link=" + urllib.parse.quote(link))])
             if not sub.startswith("api/"):
                 raise Http(404, "not found")
-            if self.headers.get("X-TStream") != "1" and not self.headers.get("X-TStream-Key"):
-                raise Http(403, "missing header")  # other web sites can't send it
+            if self.headers.get("X-TStream") != "1" and not self.shortcut():
+                raise Http(403, "missing header")  # other web sites can't send these
             api = sub[4:]
-            secure = self.headers.get("X-Forwarded-Proto") == "https"
+            # tailscale serve is https to the phone, but plain http to Caddy
+            secure = self.headers.get("X-Forwarded-Proto") == "https" or self.host().endswith(".ts.net")
             if method == "POST" and api == "login":
                 token = app.login(str(ip), self.json_body().get("pin", ""))
                 cookie = "tsadd=%s; Path=/add/; Max-Age=%d; HttpOnly; SameSite=Lax%s" % (
@@ -1165,7 +1452,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Http(404, "not found")
         except Http as e:
             body = dict({"error": str(e), "message": str(e), "ok": False}, **e.extra)
-            if self.headers.get("X-TStream-Key"):
+            if self.shortcut():
                 # iPhone Shortcuts: always a readable answer for its notification
                 if e.code == 401:
                     body["message"] = "This Shortcut's key no longer works. Make a new one on the Add videos page."

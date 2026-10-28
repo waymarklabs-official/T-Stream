@@ -99,17 +99,17 @@ async function waitJob(page, title, re, ms) {
   check('test file needs 3 pieces', size > 16 * 1024 * 1024, size);
   await page.selectOption('#cat', 'Cartoons').catch(() => {});
   await page.setInputFiles('#files', vid);
-  const up = await waitJob(page, 'IMG_2024 holiday', /On the toy/, 120000);
+  const up = await waitJob(page, 'IMG 2024 holiday', /On the toy/, 120000);
   check('upload: sent, converted, on the toy', /On the toy/.test(up), up);
   check('upload message', /sent/.test(await page.textContent('#upmsg')), await page.textContent('#upmsg'));
-  const placed = path.join(root, 'source', 'Cartoons', 'IMG_2024 holiday.mp4');
+  const placed = path.join(root, 'source', 'Cartoons', 'IMG 2024 holiday.mp4');
   check('file arrived whole', fs.existsSync(placed) && fs.statSync(placed).size === size);
   await page.screenshot({ path: path.join(root, 'shot-add-jobs.png'), fullPage: true });
 
   console.log('toy picks them up by itself');
   const seen = await toy.waitForFunction(() => {
     const names = [...document.querySelectorAll('.card .name')].map((n) => n.textContent);
-    return names.includes('IMG_2024 holiday') && names.some((n) => n.startsWith('Mr. Fake')) && names;
+    return names.includes('IMG 2024 holiday') && names.some((n) => n.startsWith('Mr. Fake')) && names;
   }, null, { timeout: 80000, polling: 1000 }).then((h) => h.jsonValue(), (e) => String(e));
   check('new videos on the toy without a reload', Array.isArray(seen), seen);
 
@@ -120,12 +120,12 @@ async function waitJob(page, title, re, ms) {
   check('library lists both', before.length === 2, before);
   const thumbOk = await page.$eval('#library img', (i) => i.complete && i.naturalWidth > 0);
   check('thumbnails load', thumbOk);
-  const li = page.locator('#library li', { hasText: 'IMG_2024 holiday' });
+  const li = page.locator('#library li', { hasText: 'IMG 2024 holiday' });
   await li.locator('button').click();
-  await page.waitForFunction(() => ![...document.querySelectorAll('#library .job-title')].some((n) => n.textContent === 'IMG_2024 holiday'));
+  await page.waitForFunction(() => ![...document.querySelectorAll('#library .job-title')].some((n) => n.textContent === 'IMG 2024 holiday'));
   const cat = JSON.parse(fs.readFileSync(path.join(root, 'site', 'media', 'catalog.json')));
   const titles = cat.categories.flatMap((c) => c.items.map((i) => i.title));
-  check('removed from the toy', !titles.includes('IMG_2024 holiday') && !fs.existsSync(placed), titles);
+  check('removed from the toy', !titles.includes('IMG 2024 holiday') && !fs.existsSync(placed), titles);
 
   console.log('Android share target');
   const share = await ctx.newPage();
@@ -148,6 +148,15 @@ async function waitJob(page, title, re, ms) {
   check('Funnel port still serves the toy', r4.status() === 200, r4.status());
   const r5 = await ctx.request.get(base + 'add/api/state', { failOnStatusCode: false });
   check('API needs its header even with the cookie', r5.status() === 403, r5.status());
+  const scKey = await page.evaluate(async () => (await (await fetch('api/key', { method: 'POST',
+    headers: { 'X-TStream': '1', 'Content-Type': 'application/json' }, body: '{}' })).json()).key);
+  const r6 = await ctx.request.post(base + 'add/api/link', { failOnStatusCode: false,
+    headers: { Authorization: 'Bearer ' + scKey }, data: { url: 'https://youtu.be/keycheck001' } });
+  const j6 = await r6.json().catch(() => ({}));
+  check('iPhone Shortcut key works through Caddy', r6.status() === 200 && j6.id, r6.status() + ' ' + JSON.stringify(j6));
+  await page.waitForTimeout(500);
+  const accessLog = fs.readFileSync(path.join(root, 'caddy-access.log'), 'utf8');
+  check('Caddy log has requests but never the key', accessLog.includes('/add/api/link') && !accessLog.includes(scKey));
   check('no requests outside the Pi', outside.length === 0, outside.join(' '));
   check('no page errors', errors.length === 0, errors.join(' | '));
 

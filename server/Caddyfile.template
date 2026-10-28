@@ -73,8 +73,13 @@
 	# not import this.
 	@add path /add /add/*
 	handle @add {
-		@outside not remote_ip 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 ::1/128 fc00::/7 fe80::/10
+		# global IPv6 (2000::/3) gets through to the page, which only accepts
+		# addresses from the Pi's own home network
+		@outside not remote_ip 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 ::1/128 fc00::/7 fe80::/10 2000::/3
 		respond @outside 403
+		# never through Tailscale Funnel, should it ever be turned on for this port
+		@funnel header Tailscale-Funnel-Request *
+		respond @funnel 403
 		request_body {
 			max_size 20MB
 		}

@@ -32,7 +32,7 @@ url = args[args.index("--") + 1] if "--" in args else args[-1]
 if "--flat-playlist" in args:
     print(json.dumps({"title": "Test List", "entries": [
         {"id": "aaaaaaaaaa1", "title": "First One"}, {"id": "aaaaaaaaaa2", "title": "Second One"},
-        {"id": "bbbbbbbbbb1", "title": "[Private video]"}]}))
+        {"id": "bbbbbbbbbb1", "title": "[Private video]"}, {"id": "privatevid0", "title": "Became private"}]}))
     sys.exit(0)
 vid = re.search(r"v=([\w-]{11})", url).group(1)
 if vid == "privatevid0":
@@ -42,6 +42,12 @@ if vid == "brokenvid00" and not os.path.exists(os.path.join(root, "state", "fake
     sys.stderr.write("ERROR: [youtube] brokenvid00: Unable to extract nsig function code\n")
     sys.exit(1)
 out = args[args.index("-o") + 1].replace("%(ext)s", "mp4")
+if vid == "brokenconv1" and not os.path.exists(os.path.join(root, "broken-once")):
+    open(os.path.join(root, "broken-once"), "w").close()  # first download is damaged
+    print("TSTREAM-INFO " + json.dumps({"id": vid, "title": "Damaged Once", "duration": 3, "extractor_key": "Youtube"}))
+    open(out, "wb").write(b"\0" * 5000)
+    print("TSTREAM-FILE " + out, flush=True)
+    sys.exit(0)
 title = {"aaaaaaaaaa1": "First One", "aaaaaaaaaa2": "Second One"}.get(vid, "Mr. Fake: Video " + vid)
 print("TSTREAM-INFO " + json.dumps({"id": vid, "title": title, "duration": 3, "filesize_approx": 100000,
                                     "extractor_key": "Youtube"}), flush=True)
@@ -70,13 +76,13 @@ class Client:
         self.port, self.ip, self.cookie, self.key = port, ip, None, None
 
     def req(self, method, path, body=None, headers=None, raw=False):
-        h = {"X-Forwarded-For": self.ip, "Host": "pi.local"}
+        h = {"X-Forwarded-For": self.ip, "Host": "192.168.1.20"}
         if not raw:
             h["X-TStream"] = "1"
         if self.cookie:
             h["Cookie"] = self.cookie
         if self.key:
-            h["X-TStream-Key"] = self.key
+            h["Authorization"] = "Bearer " + self.key
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
             h["Content-Type"] = "application/json"
@@ -208,9 +214,29 @@ def run(port, root):
     st, j, _ = bad.post("/add/api/login", {"pin": pin})
     check("right PIN still refused while locked out", st == 429, st)
 
+    st, j, _ = Client(port).req("GET", "/add/api/state", headers={"Host": "evil.example.com"})
+    check("unknown Host refused (DNS rebinding)", st == 403 and "address" in j.get("error", ""), (st, j))
+    st, j, _ = Client(port).req("GET", "/add/api/state", headers={"Host": socket.gethostname().split(".")[0] + ".local"})
+    check("<hostname>.local accepted", st == 401, st)
+    st, j, _ = Client(port).req("GET", "/add/api/state", headers={"Host": "pi.tail1234.ts.net"})
+    check("the Pi's ts.net name accepted", st == 401, st)
+    st, j, _ = Client(port).req("GET", "/add/api/state", headers={"Host": "other.tail9999.ts.net"})
+    check("another ts.net name refused", st == 403, st)
+
+    wrong = "000000" if pin != "000000" else "111111"
+    for i in range(95):  # 6 tries above + these = 101, from addresses that each stay under 5
+        Client(port, ip="10.9.%d.%d" % (i // 4, i % 4)).post("/add/api/login", {"pin": wrong})
+    st, j, _ = Client(port, ip="10.8.0.1").post("/add/api/login", {"pin": pin})
+    check("100 wrong PINs in all: even the right one needs a new PIN", st == 429 and "new-pin" in j.get("error", ""),
+          (st, j))
+    with open(os.path.join(root, "state", "add-pin.txt"), "w") as f:  # what tstream new-pin does
+        f.write("24681357\n")
+    time.sleep(0.01)
+    pin = "24681357"
+
     c = Client(port)
     st, j, _ = c.post("/add/api/login", {"pin": pin})
-    check("login with PIN sets a cookie", st == 200 and c.cookie, (st, j))
+    check("a new PIN opens it again", st == 200 and c.cookie, (st, j))
     st, s, _ = c.get("/add/api/state")
     check("state", st == 200 and "jobs" in s and s["space"]["free"] > 0 and s["ytdlp"] is True, (st, s))
     check("state has the https address", s.get("httpsUrl") == "https://pi.tail1234.ts.net/add/", s.get("httpsUrl"))
@@ -234,7 +260,7 @@ def run(port, root):
     check("wrong offset -> 409 with the right one", st == 409 and j.get("offset") == half, (st, j))
     # a piece cut off mid-way must leave no half piece behind
     s2 = socket.create_connection(("127.0.0.1", port))
-    hdr = ("PUT /add/api/upload/%s?offset=%d HTTP/1.1\r\nHost: pi.local\r\nX-TStream: 1\r\nX-Forwarded-For: "
+    hdr = ("PUT /add/api/upload/%s?offset=%d HTTP/1.1\r\nHost: 192.168.1.20\r\nX-TStream: 1\r\nX-Forwarded-For: "
            "192.168.1.50\r\nCookie: %s\r\nContent-Length: %d\r\n\r\n" % (uid, half, c.cookie, size - half))
     s2.sendall(hdr.encode() + data[half:half + 1000])
     s2.close()
@@ -261,6 +287,20 @@ def run(port, root):
     check("in the toy's catalog", "IMG 0001" in titles, titles)
     st, j, _ = c.post("/add/api/upload", meta)
     check("same file once more -> already on the toy", st == 200 and j.get("already"), (st, j))
+    st, j, _ = c.req("PUT", "/add/api/upload/%s?offset=%d" % (uid, half), data[half:])
+    check("last piece sent again (answer was lost) -> done, not an error", st == 200 and j.get("done"), (st, j))
+    st, j, _ = c.post("/add/api/upload", dict(meta, category="Other"))
+    check("same file under another category -> same upload", st == 200 and j.get("done"), (st, j))
+
+    open(os.path.join(root, "source", "Blocked"), "w").close()  # a file where the folder should be
+    small = data[:4096]
+    m2 = {"name": "small.mp4", "size": len(small), "lastModified": 1, "type": "video/mp4", "category": "Blocked"}
+    st, j, _ = c.post("/add/api/upload", m2)
+    st, j, _ = c.req("PUT", "/add/api/upload/%s?offset=0" % j["id"], small)
+    check("file that can't be saved -> a reason, and the job says so", st == 500 and "could not save" in j.get(
+        "error", ""), (st, j))
+    sj = job(c, lambda x: x["name"] == "small.mp4")
+    check("job failed (not stuck at 100%)", sj and sj["state"] == "failed", sj)
 
     print("links")
     st, j, _ = c.post("/add/api/link", {"url": "not a link", "category": "Cartoons"})
@@ -292,6 +332,15 @@ def run(port, root):
     check("yt-dlp out of date -> updated and tried again", bj and bj["state"] == "ready"
           and os.path.exists(os.path.join(root, "state", "fake-updated")), bj)
 
+    st, j, _ = c.post("/add/api/link", {"url": "https://youtu.be/brokenconv1", "category": "Cartoons"})
+    dj = wait_for(lambda: job(c, lambda x: x["id"] == j["id"] and x["state"] == "failed"), 90)
+    check("damaged download: conversion fails, with Try again", dj and "Could not convert" in (dj["error"] or "")
+          and dj["canRetry"], dj)
+    st, k, _ = c.post("/add/api/link", {"url": "https://youtu.be/brokenconv1", "category": "Cartoons"})
+    check("adding it again tries again", st == 200 and "Trying again" in k.get("message", ""), (st, k))
+    dj = wait_for(lambda: job(c, lambda x: x["id"] == j["id"] and x["state"] == "ready"), 90)
+    check("downloaded again and on the toy", dj, job(c, lambda x: x["id"] == j["id"]))
+
     st, j, _ = c.post("/add/api/link", {"url": "https://youtu.be/slowvid0000", "category": "Cartoons"})
     wait_for(lambda: job(c, lambda x: x["id"] == j["id"] and x["state"] == "downloading"), 30)
     st2, k, _ = c.post("/add/api/job/%s/cancel" % j["id"])
@@ -305,12 +354,16 @@ def run(port, root):
                                         "category": "Songs", "watch": True})
     check("playlist accepted", st == 200 and j.get("id"), (st, j))
     pl = wait_for(lambda: job(c, lambda x: x["id"] == j["id"] and x["state"] == "listed"), 30)
-    check("playlist read: 2 videos (private one skipped)", pl and pl["added"] == 2 and pl["title"] == "Test List", pl)
+    check("playlist read: 2 videos (private ones and one already tried skipped)", pl and pl["added"] == 2
+          and pl["title"] == "Test List", pl)
     both = wait_for(lambda: len([x for x in c.get("/add/api/state")[1]["jobs"]
                                  if x["category"] == "Songs" and x["state"] == "ready"]) == 2, 120)
     check("playlist videos on the toy", both)
     st, s, _ = c.get("/add/api/state")
     check("playlist is watched", [p["id"] for p in s["playlists"]] == ["PLtest123"], s["playlists"])
+    st, j, _ = c.post("/add/api/link", {"url": "https://www.youtube.com/playlist?list=PLtest123", "category": "Songs"})
+    again = wait_for(lambda: job(c, lambda x: x["id"] == j.get("id") and x["state"] == "listed"), 30)
+    check("reading it again adds nothing", again and again["added"] == 0, again)
 
     print("remove")
     st, lib, _ = c.get("/add/api/library")

@@ -325,43 +325,59 @@
     try { await blob.slice(0, 1).arrayBuffer(); return true; } catch (e) { return false; }
   }
 
+  // Network trouble and a restarting Pi (Caddy answers 502-504) are worth
+  // waiting for; anything else is the Pi saying no, with a reason.
+  const transient = (err) => !err.status || err.status === 502 || err.status === 503 || err.status === 504;
+
   async function uploadOne(u) {
     const f = u.file;
     const left = uploadQueue.length > 1 ? ' (' + (uploadQueue.length - 1) + ' more after this)' : '';
+    const meta = { name: f.name, size: f.size, lastModified: f.lastModified, type: f.type, category: u.category };
     setMsg('upmsg', 'Preparing ' + f.name + '...');
-    const duration = await videoDuration(f);
-    const start = await api('POST', 'upload', {
-      name: f.name, size: f.size, lastModified: f.lastModified, type: f.type,
-      category: u.category, duration
-    });
-    if (start.already) {
-      setMsg('upmsg', f.name + ' is already on the toy.', 'ok');
-      return;
-    }
-    let offset = start.offset;
+    meta.duration = await videoDuration(f);
     let delay = 1000, failures = 0;
-    while (offset < f.size) {
+    async function retryLater(err) {
+      if (!transient(err)) throw err; // refused: say why (full card, cancelled, ...)
+      setMsg('upmsg', 'Connection lost; trying again...' + left);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30000);
+    }
+    // Where to continue (after a reload too); this also finishes a file the
+    // Pi has whole but did not get to save.
+    async function ask() {
+      for (;;) {
+        await whenUsable();
+        try { return await api('POST', 'upload', meta); } catch (err) { await retryLater(err); }
+      }
+    }
+    let r = await ask();
+    const id = r.id;
+    let offset = r.offset;
+    while (!r.done) {
+      if (offset >= f.size) {  // everything sent, but no "saved" yet
+        r = await ask();
+        offset = r.offset;
+        if (!r.done && offset >= f.size) throw new Error('The Pi could not save this video. Try again.');
+        continue;
+      }
       await whenUsable();
       setMsg('upmsg', 'Sending ' + f.name + ': ' + Math.floor(offset * 100 / f.size) + '%' + left);
       const piece = f.slice(offset, Math.min(f.size, offset + PIECE));
       try {
-        const r = await api('PUT', 'upload/' + start.id + '?offset=' + offset, piece);
+        r = await api('PUT', 'upload/' + id + '?offset=' + offset, piece);
         offset = r.offset;
         delay = 1000;
         failures = 0;
       } catch (err) {
         if (err.status === 409 && typeof err.body.offset === 'number') { offset = err.body.offset; continue; }
-        if (err.status && err.status < 500) throw err; // refused: say why
         failures++;
-        if (failures >= 4 && !(await readable(piece))) {
+        if (transient(err) && failures >= 4 && !(await readable(piece))) {
           throw new Error('The phone stopped letting the page read this file. Pick it again; it continues where it stopped.');
         }
-        setMsg('upmsg', 'Connection lost; trying again...' + left);
-        await sleep(delay);
-        delay = Math.min(delay * 2, 30000);
+        await retryLater(err);
       }
     }
-    setMsg('upmsg', f.name + ' sent. It is converted for the toy next.', 'ok');
+    setMsg('upmsg', r.already ? f.name + ' is already on the toy.' : f.name + ' sent. It is converted for the toy next.', 'ok');
   }
 
   async function holdScreen(on) {
@@ -429,7 +445,7 @@
       }
       li.appendChild(main);
       const acts = el('div', 'job-actions');
-      if (j.state === 'failed' && (j.kind === 'link' || j.kind === 'playlist')) {
+      if (j.canRetry) {
         acts.appendChild(button('Try again', () => api('POST', 'job/' + j.id + '/retry')));
       }
       if (j.state === 'queued' || j.state === 'downloading' || (j.state === 'uploading' && !isUploading(j))) {
@@ -546,7 +562,7 @@
       const base = state.httpsUrl || (location.origin + location.pathname.replace(/[^/]*$/, ''));
       $('sc-url').textContent = base + 'api/link';
       $('sc-tailscale').hidden = !/\.ts\.net|\/\/100\./.test(base);
-      $('sc-key').textContent = r.key;
+      $('sc-key').textContent = 'Bearer ' + r.key;
       $('shortcutsteps').hidden = false;
       $('makekey').hidden = true;
     } catch (err) {

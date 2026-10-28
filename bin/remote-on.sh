@@ -46,10 +46,23 @@ for hp, web in (cfg.get("Web") or {}).items():
     echo "(Tailscale already serves something else on https port 443; the add-videos page stays on http.)"
     return 1
   fi
-  timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80 >/dev/null 2>&1 || return 1
-  mkdir -p "$ROOT/state"
-  printf 'https://%s/add/\n' "$dns" > "$ROOT/state/add-https-url.txt"
-  chown "$(cat "$ROOT/.owner" 2>/dev/null || echo root)": "$ROOT/state/add-https-url.txt" 2>/dev/null || true
+  local owner url_file="$ROOT/state/add-https-url.txt"
+  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
+  # 0 can also mean "HTTPS is not on for your tailnet" (it prints a link to
+  # turn it on), so check that the setting is really there
+  out=$(timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80 2>&1) || true
+  if ! tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+cfg = json.load(sys.stdin) or {}
+h = ((cfg.get("Web") or {}).get(sys.argv[1] + ":443") or {}).get("Handlers") or {}
+sys.exit(0 if (h.get("/") or {}).get("Proxy") == "http://127.0.0.1:80" else 1)
+' "$dns" 2>/dev/null; then
+    runuser -u "$owner" -- rm -f "$url_file"
+    [ -z "$out" ] || echo "$out" | grep -i "https\|enable\|visit" | head -3
+    return 1
+  fi
+  # written as the owner (state/ is the owner's folder)
+  runuser -u "$owner" -- sh -c 'printf "https://%s/add/\n" "$1" > "$2"' sh "$dns" "$url_file"
 }
 
 if [ "${1:-}" = --add-page ]; then

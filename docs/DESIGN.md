@@ -155,6 +155,37 @@ prep changes that came with it:
 - It deletes a rebuilt video's previous version 6 h after the rebuild.
 - It discards a build whose source was removed meanwhile.
 
+## How prep runs FFmpeg
+
+Bookworm's FFmpeg 5.1 runs one process's work mostly one step after another,
+so a single `ffmpeg` that decodes, encodes two video tracks and normalises the
+sound kept fewer than 2 of the Pi's 4 cores busy. Audio and video simply took
+turns. prep now runs these side by side (`build_ffmpeg_jobs`, `run_encode`):
+
+- **video:** decodes and scales the source once and encodes the H.264 track.
+  It passes the picture to a second `ffmpeg` that encodes the MPEG-1 track,
+  as raw video through a pipe.
+- **audio:** runs `loudnorm` once (it used to run once per audio format) and
+  encodes Opus and MP3.
+
+The output is the same as before: video segments and MP3 are byte-identical,
+and the Opus audio decodes to the same samples. Only the Ogg stream serial
+number differs, and it is random anyway.
+
+Speed, measured on a 4-core PC: about 2x faster, 53-57% less time, at the same
+quality. Estimated for a Pi 4, not measured: a 10-minute 480p YouTube video
+takes about 6-10 minutes instead of about 18. If any of the processes fails
+or stalls, or prep is stopped, all of them are stopped, and the error from
+the one that failed is reported.
+
+Possible later steps:
+- A faster x264 setting (`me=dia:subme=1`) saves about another 10% for 3-8%
+  bigger files. It would change the settings hash, and that rebuilds the
+  whole library.
+- A static loudness gain instead of `loudnorm` is cheaper, but it changes the
+  sound of every video.
+- The Pi 4's hardware H.264 encoder is untested and absent on a Pi 5.
+
 ## Encoding on another computer
 
 Encoding is faster on a desktop (needs Python 3, FFmpeg, `pip install av`):

@@ -289,9 +289,25 @@ def video_codec_args(kind, cfg, gop):
     raise ValueError(kind)
 
 
-def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
-    """One ffmpeg run decodes the source once and writes every video track
-    plus every audio format, all aligned to start at t=0."""
+FF_HEAD = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error"]
+NO_META = ["-map_metadata", "-1", "-map_chapters", "-1"]
+
+
+def build_ffmpeg_jobs(src, info, cfg, fps, tmp, duration):
+    """The ffmpeg runs that make every video track and every audio format,
+    all aligned to start at t=0, run side by side by run_encode():
+
+        video  decodes and scales the source once, encodes the first track,
+               and hands the picture to one more ffmpeg per extra track
+               through a pipe (raw video); "{fd<i>}" marks where
+        audio  normalises the sound once and encodes every audio format
+
+    ffmpeg 5.1 (Bookworm) runs one process's work mostly one step after
+    another, so this is about twice as fast on a Pi, with the same output.
+    Without fd passing (Windows) each track decodes the source itself.
+
+    Returns (video_cmds, audio_cmd, outputs).
+    """
     streams = info.get("streams", [])
     vstreams = [s for s in streams if s.get("codec_type") == "video"
                 and not s.get("disposition", {}).get("attached_pic")]
@@ -312,18 +328,6 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
     offset = start(vstreams[0].get("start_time")) - start(info.get("format", {}).get("start_time"))
     shift = "PTS-%.6f/TB" % offset
 
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
-           "-progress", "pipe:1", "-nostats", "-i", src]
-    if astreams:
-        amap = "0:%d" % astreams[0]["index"]
-    else:
-        # Silent track: the audio element is the player's clock, so every
-        # item needs one.
-        if not duration:
-            raise RuntimeError("cannot tell how long this video is")
-        cmd += ["-f", "lavfi", "-t", "%.3f" % duration, "-i", "anullsrc=r=48000:cl=stereo"]
-        amap = "1:a"
-
     h = int(cfg["height"])
     tracks = cfg["videoTracks"]
     fps_s = "%d/%d" % (fps.numerator, fps.denominator)
@@ -334,96 +338,166 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
     chain = ("[0:%d]setpts=%s,yadif=deint=interlaced,"
              "scale=w='trunc(%s*dar/2)*2':h='trunc(%s/2)*2':flags=bicubic,"
              "setsar=1,fps=fps=%s:start_time=0,format=yuv420p" % (vi, shift, oh, oh, fps_s))
-    labels = ["v%d" % i for i in range(len(tracks))]
-    if len(tracks) > 1:
-        chain += ",split=%d%s" % (len(tracks), "".join("[%s]" % l for l in labels))
-    else:
-        chain += "[%s]" % labels[0]
-    cmd += ["-filter_complex", chain]
-
     gop = max(1, int(round(float(fps) * float(cfg["keyframeSeconds"]))))
-    outputs = {}
-    for kind, label in zip(tracks, labels):
-        path = os.path.join(tmp, "%s.mkv" % kind)
-        cmd += ["-map", "[%s]" % label, "-an", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
-        cmd += video_codec_args(kind, cfg, gop)
-        cmd += ["-max_muxing_queue_size", "4096", "-f", "matroska", path]
-        outputs[kind] = path
+    outputs = {kind: os.path.join(tmp, "%s.mkv" % kind) for kind in tracks}
 
-    for fmt in cfg["audioFormats"]:
-        rate = 48000 if fmt == "opus" else 44100
-        af = ["asetpts=%s" % shift if astreams else "anull", "aresample=async=1:first_pts=0"]
-        if cfg["normalizeAudio"] and astreams:
-            if duration:
-                # loudnorm needs 3 s of input (shorter silence turns into NaN,
-                # which crashes the MP3 encoder): pad first, trim back after.
-                af += ["apad=whole_dur=%.3f" % max(duration, 3.5), "loudnorm=I=-18:TP=-2:LRA=11",
-                       "atrim=end=%.3f" % duration]
-            else:
-                af.append("loudnorm=I=-18:TP=-2:LRA=11")
-        elif duration:
-            af.append("apad=whole_dur=%.3f" % duration)
-        af.append("aresample=%d" % rate)
-        path = os.path.join(tmp, AUDIO_FORMATS[fmt]["file"])
-        cmd += ["-map", amap, "-vn", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
-                "-af", ",".join(af), "-ac", "2"]
-        if fmt == "opus":
-            cmd += ["-c:a", "libopus", "-b:a", cfg["opusBitrate"], "-f", "ogg"]
+    def encode(kind):
+        return (["-an", "-sn", "-dn"] + NO_META + video_codec_args(kind, cfg, gop)
+                + ["-max_muxing_queue_size", "4096", "-f", "matroska", outputs[kind]])
+
+    progress = ["-progress", "pipe:1", "-nostats"]
+    video_cmds = []
+    if len(tracks) > 1 and os.name == "posix":
+        labels = "".join("[v%d]" % i for i in range(len(tracks)))
+        first = FF_HEAD + progress + ["-i", src, "-filter_complex",
+                                      chain + ",split=%d%s" % (len(tracks), labels), "-map", "[v0]"]
+        first += encode(tracks[0])
+        for i in range(1, len(tracks)):
+            first += ["-map", "[v%d]" % i, "-an", "-sn", "-dn", "-c:v", "rawvideo", "-f", "nut", "{fd%d}" % i]
+        video_cmds.append(first)
+        for kind in tracks[1:]:
+            video_cmds.append(FF_HEAD + ["-f", "nut", "-i", "pipe:0", "-map", "0:v"] + encode(kind))
+    else:
+        for i, kind in enumerate(tracks):
+            video_cmds.append(FF_HEAD + (progress if i == 0 else []) + ["-i", src, "-filter_complex",
+                                                                        chain + "[v]", "-map", "[v]"]
+                              + encode(kind))
+
+    audio_cmd = FF_HEAD + progress + ["-i", src]
+    if astreams:
+        amap = "0:%d" % astreams[0]["index"]
+    else:
+        # Silent track: the audio element is the player's clock, so every
+        # item needs one.
+        if not duration:
+            raise RuntimeError("cannot tell how long this video is")
+        audio_cmd += ["-f", "lavfi", "-t", "%.3f" % duration, "-i", "anullsrc=r=48000:cl=stereo"]
+        amap = "1:a"
+    af = ["asetpts=%s" % shift if astreams else "anull", "aresample=async=1:first_pts=0"]
+    if cfg["normalizeAudio"] and astreams:
+        if duration:
+            # loudnorm needs 3 s of input (shorter silence turns into NaN,
+            # which crashes the MP3 encoder): pad first, trim back after.
+            af += ["apad=whole_dur=%.3f" % max(duration, 3.5), "loudnorm=I=-18:TP=-2:LRA=11",
+                   "atrim=end=%.3f" % duration]
         else:
-            cmd += ["-c:a", "libmp3lame", "-b:a", cfg["mp3Bitrate"], "-f", "mp3"]
-        cmd += ["-max_muxing_queue_size", "4096", path]
+            af.append("loudnorm=I=-18:TP=-2:LRA=11")
+    elif duration:
+        af.append("apad=whole_dur=%.3f" % duration)
+    fmts = cfg["audioFormats"]
+    graph = "[%s]%s,asplit=%d%s" % (amap, ",".join(af), len(fmts), "".join("[s%d]" % i for i in range(len(fmts))))
+    for i, fmt in enumerate(fmts):
+        graph += ";[s%d]aresample=%d[a%d]" % (i, 48000 if fmt == "opus" else 44100, i)
+    audio_cmd += ["-filter_complex", graph]
+    for i, fmt in enumerate(fmts):
+        path = os.path.join(tmp, AUDIO_FORMATS[fmt]["file"])
+        audio_cmd += ["-map", "[a%d]" % i, "-vn", "-sn", "-dn"] + NO_META + ["-ac", "2"]
+        if fmt == "opus":
+            audio_cmd += ["-c:a", "libopus", "-b:a", cfg["opusBitrate"], "-f", "ogg"]
+        else:
+            audio_cmd += ["-c:a", "libmp3lame", "-b:a", cfg["mp3Bitrate"], "-f", "mp3"]
+        audio_cmd += ["-max_muxing_queue_size", "4096", path]
         outputs[fmt] = path
-    return cmd, outputs
+    return video_cmds, audio_cmd, outputs
 
 
 STALL_SECONDS = 900
 
 
-def run_ffmpeg_with_progress(cmd, duration, label, progress=None):
-    # stderr goes to a file: a damaged source can print megabytes of decode
-    # errors, which would fill a pipe nobody reads and hang ffmpeg forever.
-    errf = tempfile.TemporaryFile()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, encoding="utf-8", errors="replace")
-    last = -1
-    start = time.time()
-    alive = [time.time(), False]
+def run_encode(video_cmds, audio_cmd, duration, label, progress=None):
+    """Runs the video and audio ffmpegs side by side. Progress comes from
+    the first video process; if any process fails, stalls, or we are
+    stopped, all of them are stopped."""
+    procs = []  # (name, process, stderr file)
+    lock = threading.Lock()
+    alive = {"video": time.time(), "audio": time.time()}
+    stalled = []
 
-    def watchdog():  # kill ffmpeg if it stops making progress (stuck input)
-        while p.poll() is None:
-            if time.time() - alive[0] > STALL_SECONDS:
-                alive[1] = True
-                p.kill()
-                return
-            time.sleep(5)
-    threading.Thread(target=watchdog, daemon=True).start()
+    def launch(name, cmd, **kw):
+        # stderr goes to a file: a damaged source can print megabytes of
+        # decode errors, which would fill a pipe nobody reads and hang ffmpeg.
+        errf = tempfile.TemporaryFile()
+        p = subprocess.Popen(cmd, stderr=errf, **kw)
+        with lock:
+            procs.append((name, p, errf))
+        return p
 
-    try:
+    def stop_all():
+        with lock:
+            for _, p, _ in procs:
+                if p.poll() is None:
+                    p.kill()
+
+    def follow(p, name, report=None):
+        """Reads ffmpeg's -progress lines; any line means it is still working."""
+        last, t0 = -1, time.time()
         for line in p.stdout:
-            alive[0] = time.time()
-            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+            alive[name] = time.time()
+            if report and (line.startswith("out_time_us=") or line.startswith("out_time_ms=")) and duration:
                 try:
                     t = int(line.split("=", 1)[1]) / 1e6
                 except ValueError:
                     continue
-                if duration:
-                    pct = int(min(99, t * 100 / duration))
-                    if progress:
-                        progress(pct)
-                    if pct >= last + 10:
-                        last = pct
-                        speed = t / max(0.001, time.time() - start)
-                        log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, speed))
+                pct = int(min(99, t * 100 / duration))
+                if progress:
+                    progress(pct)
+                if pct >= last + 10:
+                    last = pct
+                    log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, t / max(0.001, time.time() - t0)))
+        p.wait()
+        if p.returncode != 0:
+            stop_all()  # one failed: the rest can't make a whole item
+
+    def watchdog():  # kill everything if a part stops making progress (stuck input)
+        while any(p.poll() is None for _, p, _ in list(procs)):
+            for name in ("video", "audio"):
+                running = any(n == name and p.poll() is None for n, p, _ in list(procs))
+                if running and time.time() - alive[name] > STALL_SECONDS:
+                    stalled.append(name)
+                    stop_all()
+                    return
+            time.sleep(5)
+
+    try:
+        first = list(video_cmds[0])
+        pipes = []
+        for i in range(1, len(video_cmds)):
+            if "{fd%d}" % i in first:  # the first process feeds this one through a pipe
+                r, w = os.pipe()
+                first[first.index("{fd%d}" % i)] = "pipe:%d" % w
+                pipes.append((r, w))
+        main = launch("video", first, stdout=subprocess.PIPE, pass_fds=[w for _, w in pipes],
+                      encoding="utf-8", errors="replace")
+        for i, cmd in enumerate(video_cmds[1:]):
+            if pipes:
+                r, w = pipes[i]
+                os.close(w)  # only the first process writes
+                launch("video", cmd, stdin=r, stdout=subprocess.DEVNULL)
+                os.close(r)
+            else:
+                launch("video", cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        audio = launch("audio", audio_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       encoding="utf-8", errors="replace")
+        threading.Thread(target=watchdog, daemon=True).start()
+        at = threading.Thread(target=follow, args=(audio, "audio"), daemon=True)
+        at.start()
+        follow(main, "video", report=True)
+        at.join()
+        for _, p, _ in procs:
+            p.wait()
     finally:
-        if p.poll() is None:  # we were stopped: stop ffmpeg too
-            p.kill()
-    p.wait()
-    errf.seek(0)
-    err = errf.read().decode("utf-8", "replace")
-    errf.close()
-    if alive[1]:
+        stop_all()  # we were stopped (Ctrl-C, systemd): stop ffmpeg too
+    errs = []
+    for name, p, errf in procs:
+        errf.seek(0)
+        err = errf.read().decode("utf-8", "replace").strip()
+        errf.close()
+        if p.returncode != 0:
+            errs.append("[%s] %s" % (name, err[-1500:] or "exit %s" % p.returncode))
+    if stalled:
         raise RuntimeError("ffmpeg made no progress for %d minutes and was stopped" % (STALL_SECONDS // 60))
-    if p.returncode != 0:
-        raise RuntimeError("ffmpeg failed:\n%s" % err.strip()[-2000:])
+    if errs:
+        raise RuntimeError("ffmpeg failed:\n%s" % "\n".join(errs)[-3000:])
 
 
 def make_thumb(video_path, duration, width, out_path):
@@ -488,11 +562,11 @@ def build_item(src, rel, category, out_dir, cfg, key, mtime, size, progress=None
             raise NoSpace("not enough free space on the Pi: converting this video needs about %s, %s is free"
                           % (gb(need), gb(free)))
 
-        cmd, outputs = build_ffmpeg_cmd(src, info, cfg, fps, vdir, duration)
+        video_cmds, audio_cmd, outputs = build_ffmpeg_jobs(src, info, cfg, fps, vdir, duration)
         log("    encoding %s @ %s fps -> %s + %s" % (
             "x".join(str(x) for x in (vstreams[0].get("width"), vstreams[0].get("height"))),
             "%.3f" % float(fps), "+".join(cfg["videoTracks"]), "+".join(cfg["audioFormats"])))
-        run_ffmpeg_with_progress(cmd, duration, "encode", progress)
+        run_encode(video_cmds, audio_cmd, duration, "encode", progress)
 
         tracks = []
         for kind in cfg["videoTracks"]:

@@ -718,7 +718,7 @@ class App:
             dup = self.duplicate("youtube:" + vid)
             if dup:
                 return {"message": dup, "already": True}
-        self.need_space(0, 1800)
+        self.need_space(0, 600)  # a 10-minute video; checked again once its length is known
         j = self.new_job("link", url=url, key="youtube:" + vid if vid else None, category=category,
                          title=title or None, wantTitle=bool(title))
         self.wake_dl.set()

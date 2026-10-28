@@ -82,10 +82,12 @@ DEFAULT_CONFIG = {
     "hotspot": {"ssid": "CanvasPlayer", "password": "change-me-please", "country": "US"},
 }
 
-# Disk space one hour of video can take while it converts (the encoded
-# intermediates plus the finished segments), per track at 480p. Measured
-# worst cases are about half of this; the rest is margin.
-CONVERT_BYTES_PER_HOUR = {"h264": 1.8e9, "vp9": 1.8e9, "vp8": 3.0e9, "mpeg1": 4.6e9}
+# Disk space one hour of video takes while it converts, per track at 480p:
+# the encoded intermediate plus the finished segments, i.e. twice the size of
+# detailed 3D animation (measured 0.67 GB/h H.264, 1.3 GB/h MPEG-1; flat
+# cartoons are a third of that). Unusually busy video can need more; ffmpeg
+# then fails cleanly with "no space" and the file is tried again next run.
+CONVERT_BYTES_PER_HOUR = {"h264": 1.4e9, "vp9": 1.4e9, "vp8": 2.2e9, "mpeg1": 2.6e9}
 AUDIO_BYTES_PER_HOUR = 0.15e9
 SPACE_RESERVE = 300 * 1000 * 1000  # never fill the card completely
 
@@ -322,9 +324,13 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
     h = int(cfg["height"])
     tracks = cfg["videoTracks"]
     fps_s = "%d/%d" % (fps.numerator, fps.denominator)
+    # "height" caps the short side, so upright phone videos and YouTube
+    # Shorts get 480 x 852, not 270 x 480 (same pixels as a wide video):
+    # out_h = min(ih * m, H) / m with m = min(dar, 1); out_w = out_h * dar
+    oh = "min(ih*min(dar\\,1)\\,%d)/min(dar\\,1)" % h
     chain = ("[0:%d]setpts=%s,yadif=deint=interlaced,"
-             "scale=w='trunc(min(ih\\,%d)*dar/2)*2':h='trunc(min(ih\\,%d)/2)*2':flags=bicubic,"
-             "setsar=1,fps=fps=%s:start_time=0,format=yuv420p" % (vi, shift, h, h, fps_s))
+             "scale=w='trunc(%s*dar/2)*2':h='trunc(%s/2)*2':flags=bicubic,"
+             "setsar=1,fps=fps=%s:start_time=0,format=yuv420p" % (vi, shift, oh, oh, fps_s))
     labels = ["v%d" % i for i in range(len(tracks))]
     if len(tracks) > 1:
         chain += ",split=%d%s" % (len(tracks), "".join("[%s]" % l for l in labels))
@@ -875,7 +881,8 @@ def prep_loop(args, cfg, key, source_dir, media_dir, status):
         except Exception as e:  # keep going with the rest of the library
             failed += 1
             failures.append(name)
-            status.fail(name, mtime, size, e)
+            full = "no space left on device" in str(e).lower()  # tried again next run, like NoSpace
+            status.fail(name, mtime, size, "not enough free space on the Pi" if full else e, retry=full)
             log("    FAILED: %s" % e)
         status.set(current=None)
 

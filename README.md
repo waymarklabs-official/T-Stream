@@ -180,7 +180,7 @@ app WebViews that ignore user certificates; then just use http:// and MPEG-1.
 | Key | Default | Meaning |
 |---|---|---|
 | `videoTracks` | `["h264","mpeg1"]` | Tracks to make, in order of preference. Also `vp9`, `vp8`. Drop one to save encoding time and space once diag shows what works |
-| `height` | `480` | Picture height (never upscales). `360` for weak devices |
+| `height` | `480` | Picture size: the height of wide videos, the width of upright ones such as YouTube Shorts (never upscales). `360` for weak devices |
 | `maxFps` | `30` | Frame-rate cap (`25` or `24` for weak devices) |
 | `keyframeSeconds` / `segmentSeconds` | `1` / `4` | Seek granularity / file size per request |
 | `h264` | main, veryfast, crf 23 | x264 settings. `"profile": "baseline"` is cheaper to decode in software |

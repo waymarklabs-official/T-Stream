@@ -69,3 +69,23 @@ Built in from the start: it is what the toy uses on plain `http://`, or if WebCo
 - [ ] Reboot the Pi: after ~1 minute the hotspot is back and the toy reconnects
 - [ ] `hotspot-off` (over SSH via the hotspot) drops the session; a minute later `ssh <user>@<pi-name>.local` works from home Wi-Fi
 - [ ] Safety net: with the hotspot off, switch the router off and reboot the Pi; ~3-4 minutes later the hotspot appears. Switch the router back on and run `hotspot-off`
+
+## Adding videos from the phone
+
+On your phone, on the same Wi-Fi as the Pi (then once more with only Tailscale on, away from home):
+
+- [ ] `http://<pi>/add/` asks for the PIN from `tstream`; after it, reloading the page doesn't ask again
+- [ ] YouTube app: **Share → Copy link**, long-press the box, **Paste**: "Added to the queue" right away; Activity shows Downloading → Converting → **On the toy**
+- [ ] The toy, left on its home screen, shows the new video within about a minute of "On the toy" (no reload)
+- [ ] A made-for-kids cartoon and a Short both download (the Short plays upright, not tiny)
+- [ ] The same link again says **Already on the toy**
+- [ ] **Choose videos** with a 1-2 GB phone video; lock the phone halfway for a minute, unlock: it continues and finishes. Audio is there on the toy
+- [ ] iPhone: also try a video picked under **Photo Library** (it may arrive compressed; check that it has sound)
+- [ ] A video from Google Drive / iCloud through **Choose videos → Browse/Drive**
+- [ ] Android: open the https address from **Help and settings** in Chrome, **Install app**; YouTube **Share** lists **Add videos**, and tapping it opens the page with the link; **Send to the toy** works
+- [ ] iPhone: build the **Send to toy** Shortcut from **Help and settings**; YouTube **Share → Send to toy** shows a notification "Added to the queue"
+- [ ] **On the toy → Remove** on one video: it disappears from the toy's grid within a minute; `tstream` shows more free space ~15 minutes later
+- [ ] On the hotspot: `http://10.42.0.1/add/` works for phone uploads while the toy plays a video without stuttering
+- [ ] Time one conversion: a 10-minute YouTube cartoon from "Converting" to "On the toy" (note it in the report)
+- [ ] `tstream new-pin`: the phone asks for the PIN again
+

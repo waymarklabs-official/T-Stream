@@ -40,18 +40,68 @@ nothing does, because the player picks the best working mode by itself.
 
 ### 3. Add videos
 
-Put files in `/srv/canvas-player/source/<Category>/`. Each folder becomes a
-category in the dropdown. Then run `prep`, or just wait: new files are
-converted automatically every 15 minutes. Any common format works (mp4, mkv,
-avi, mov, mpg, ...). To encode on a faster computer instead, see
+**From your phone: the add-videos page.** Open `http://<pi-address>/add/` on
+your phone and type the PIN that `tstream` shows (once; the phone remembers
+it). Pick the category the video should go in on the toy, then:
+
+- **A YouTube video:** in the YouTube app tap **Share → Copy link**. On the
+  page, press and hold in the box and tap **Paste**: it is sent right away. The
+  Pi downloads it at 480p (H.264 when YouTube has it, which the Pi converts
+  fastest), converts it, and it appears on the toy's home screen by itself.
+  The **Activity** list shows each step with a progress bar.
+- **A whole playlist:** paste a playlist link. With **Keep watching** ticked,
+  videos added to that playlist later come by themselves (checked hourly).
+  YouTube doesn't let you save made-for-kids videos to a playlist, so this
+  suits playlists made by others or from other videos.
+- **Videos on the phone, Google Drive or iCloud:** tap **Choose videos**.
+  Uploads go in pieces: if the phone locks or the Wi-Fi drops, they continue
+  from where they stopped when you come back to the page.
+- **Share straight from the YouTube app**, without copy and paste:
+  - **Android:** with Tailscale on the phone, open the Pi's
+    `https://<pi>.<tailnet>.ts.net/add/` address (shown under **Help and
+    settings**, and by `tstream`) in Chrome and tap **⋮ → Install app**. From
+    then on YouTube's **Share** menu lists **Add videos**.
+  - **iPhone:** make a **Send to toy** Shortcut once (5 minutes); the steps,
+    with the values to copy, are under **Help and settings** on the page.
+- **On the toy** lists the library; **Remove** takes a video off the toy and
+  deletes its file, freeing the space within about 15 minutes.
+
+The page works on your home Wi-Fi, on the Pi's hotspot (`http://10.42.0.1/add/`),
+and anywhere through Tailscale (`http://<tailscale-ip>/add/`, or the https
+address above). It is never on the toy's internet link (`remote-on`), and
+everything on it needs the PIN. `tstream new-pin` makes a new PIN and logs
+every phone out. The page keeps an eye on space and refuses a video that
+would not fit.
+
+**From a computer:** put files in `/srv/canvas-player/source/<Category>/`.
+Each folder becomes a category. They are converted within 15 minutes, or run
+`prep`. Any common format works (mp4, mkv, avi, mov, mpg, ...). To encode on a
+faster computer instead, see
 [docs/DESIGN.md](docs/DESIGN.md#encoding-on-another-computer).
+
+New videos are converted newest first. A file that fails to convert is not
+tried again until it changes (`prep --force` retries it). Once a video is on
+the toy you may delete its original from `source/` to save space; it keeps
+playing, but it can't be re-encoded after a settings change, and
+`prep --prune` would remove it.
 
 ### 4. Play
 
 Open `http://<pi-address>/` on the toy, pick a category, tap a picture.
 Add that address to the toy's allowed sites in its parental settings.
 
-### 5. Offline (no internet, no router)
+### 5. Away from home (Tailscale)
+
+Run `remote-on` on the Pi once (the Pi on a Wi-Fi with internet). It installs
+Tailscale, shows a QR code to log the Pi into your free Tailscale account,
+and prints a secret link for the toy:
+`https://<pi>.<tailnet>.ts.net:8443/k/<key>/`. Bookmark it on the toy and add it
+to its allowed sites; nothing is installed on the toy. Anyone with that link
+can watch, so keep it private (`remote-on --new-link` replaces it,
+`remote-off` stops it). It also sets up the https add-videos address for your
+own Tailscale devices.
+
+### 6. Offline (no internet, no router)
 
 Run `hotspot-on` on the Pi. The Pi becomes a Wi-Fi network, with the name and
 password printed and stored in `/srv/canvas-player/config.json`. Join it on the
@@ -83,9 +133,11 @@ Wi-Fi or running its hotspot, never both:
 | Command | What it does |
 |---|---|
 | `tstream` | Status (web server, hotspot, addresses, library) and help |
-| `prep` | Convert new or changed videos. `prep --force` rebuilds all (needed after changing encoding settings); `prep --prune` removes videos whose source file was deleted |
+| `prep` | Convert new or changed videos. `prep --force` rebuilds all (needed after changing encoding settings); `prep --prune` **deletes** every video whose original file is gone from `source/` |
 | `hotspot-on` / `hotspot-off` | Pi Wi-Fi hotspot for the toy on / back to your home Wi-Fi (with automatic fallback either way). `hotspot-on "Name" "password"` sets new ones |
 | `read-diag` | Show the latest report from `diag.html` (`read-diag 3` for three) |
+| `remote-on` / `remote-off` | Secret link for the toy anywhere with internet (Tailscale Funnel) on / off; `remote-on --new-link` replaces the link |
+| `tstream new-pin` | New PIN for the add-videos page; logs out every phone and Shortcut |
 | `tstream update` | Download the newest version and reinstall; keeps videos and settings (needs internet: not in hotspot mode) |
 
 ## The player
@@ -128,7 +180,7 @@ app WebViews that ignore user certificates; then just use http:// and MPEG-1.
 | Key | Default | Meaning |
 |---|---|---|
 | `videoTracks` | `["h264","mpeg1"]` | Tracks to make, in order of preference. Also `vp9`, `vp8`. Drop one to save encoding time and space once diag shows what works |
-| `height` | `480` | Picture height (never upscales). `360` for weak devices |
+| `height` | `480` | Picture size: the height of wide videos, the width of upright ones such as YouTube Shorts (never upscales). `360` for weak devices |
 | `maxFps` | `30` | Frame-rate cap (`25` or `24` for weak devices) |
 | `keyframeSeconds` / `segmentSeconds` | `1` / `4` | Seek granularity / file size per request |
 | `h264` | main, veryfast, crf 23 | x264 settings. `"profile": "baseline"` is cheaper to decode in software |
@@ -145,6 +197,17 @@ settings take effect on the next `prep` or `hotspot-on`.
 
 ## Troubleshooting
 
+- **A YouTube video fails:** the Activity list says why in plain words
+  (private, members only, age-restricted, not available, no internet). "Prove
+  it is not a robot" means YouTube is limiting the Pi for a while; try later.
+  The downloader updates itself daily and once more when a download breaks;
+  `tstream update` also updates it.
+- **Made-for-kids videos fail with "not available":** check that the Pi runs
+  the 64-bit Raspberry Pi OS (`dpkg --print-architecture` says `arm64`). The
+  YouTube downloader needs a helper (Deno) that only exists for 64-bit.
+- **"Not enough space on the Pi":** remove videos under **On the toy** on the
+  add-videos page.
+
 - **The toy shows "Couldn't play this one":** open the debug overlay on a video
   that plays, or run `diag.html`, then run `read-diag` and look at the summary.
 - **Picture lags the sound a bit:** tap Resync. If it keeps happening, the
@@ -159,7 +222,7 @@ settings take effect on the next `prep` or `hotspot-on`.
 - **Nothing on port 80:** run `tstream`. The installer warns if another program
   (for example a Kodi web interface set to port 80) is using it.
 - Logs: `/srv/canvas-player/prep.log`, `/var/log/caddy/canvas-player.log`,
-  `journalctl -u caddy -u canvas-prep`.
+  `journalctl -u caddy -u canvas-prep -u tstream-add`.
 
 ## More
 

@@ -81,6 +81,111 @@ a time and emits segments as they complete, so a `live.py` can append to a
 manifest with `"live": true`. The player would poll the manifest; nothing in
 the format blocks this.
 
+## Adding videos from a phone (`add/addserver.py`)
+
+A small Python service (standard library only) on `127.0.0.1:8098`, run as
+the library owner by `tstream-add.service`. Caddy forwards `/add/*` to it from
+the `http://` and `https://` sites only, after checking that the client is on
+a private, hotspot, Tailscale or loopback address, and refuses anything
+carrying Tailscale's `Tailscale-Funnel-Request` header. The `:8099` site that
+Tailscale Funnel puts on the internet does not import that route, and
+`e2e-add` checks that `/add/` and `/k/<key>/add/` are 404 there. The page's
+files live in `$ROOT/add/`, not in `site/`, so the Funnel link can't serve
+them either. The service checks the address again (a global IPv6 address
+must be in the Pi's own /64), and the Host name: an IP address, the Pi's
+name with a home-network suffix (`.local`, `.lan`, ...), or its ts.net name.
+So a web page elsewhere can't aim its own domain at the Pi (DNS rebinding).
+
+- **Access:** an 8-digit PIN (`state/add-pin.txt`). Wrong PINs are limited
+  to 5 per address per 5 minutes and 100 in all for one PIN; after that only
+  `tstream new-pin` helps. That caps a guesser's chance at 1 in a million.
+  The count lives in `state/add-pin-fails.json`, and `tstream` shows it.
+  - A correct PIN gives the phone a one-year HttpOnly cookie.
+  - API calls must carry an `X-TStream` header, so other web sites can't use
+    the cookie.
+  - iPhone Shortcuts send a key made on the page as
+    `Authorization: Bearer <key>`, a header Caddy leaves out of its log.
+  - `tstream new-pin` empties `state/add-sessions.json`, which ends every
+    cookie and key. It writes as the owner, like everything that touches
+    `state/`, so root never follows a link planted there.
+- **The service** is sandboxed by systemd: it may write only `source/`,
+  `site/media/`, `state/`, `yt-dlp/` and `prep.log`. It handles at most 24
+  requests at a time and 10 minutes per request.
+- **Uploads** go in 8 MB pieces (`PUT .../upload/<id>?offset=N`) into
+  `source/.incoming/<id>.part`. prep never looks in dot folders. Each piece is
+  fsynced, and one that is cut off is truncated back, so the file is always
+  whole up to its offset. A wrong offset gets 409 with the right one. The id
+  comes from name + size + lastModified, so picking the same file
+  after a reload resumes it.
+- **Finished files** are hard-linked to `source/<Category>/<Title>.<ext>`.
+  Linking never overwrites; ` (2)` is added when the name is taken. If the
+  drive can't hard-link, the name is claimed with `O_EXCL` and the file
+  renamed. The file time is set to 61 s ago, so prep doesn't wait for "still
+  copying". Then the service starts prep if none is running.
+- **YouTube** goes through yt-dlp in `$ROOT/yt-dlp`, a venv owned by the
+  library owner, with Deno from the `[deno]` extra on 64-bit.
+  - The page updates it to the nightly build once a day before downloading,
+    and once more when a download fails in a way that usually means it is out
+    of date.
+  - Command line: `-f bv*+ba/b -S res:480,vcodec:h264,acodec:aac`, which is
+    480 on the short side so Shorts aren't tiny, and H.264 when available
+    because the Pi decodes it fastest. Plus `--no-playlist`, `--ignore-config`,
+    `--match-filters !is_live`, and machine-readable `--print` and
+    `--progress-template` lines.
+  - Downloads run one at a time, with a short pause in between: YouTube
+    allows a guest a few hundred videos an hour.
+  - A ledger (`state/add-ledger.json`) of video ids answers "already on the
+    toy". It also stops a watched playlist from bringing back a video that
+    was removed on purpose.
+- **Removing** a video deletes its source file and drops a `.removed` marker
+  in its media folder. `build_catalog` skips marked items at once, under a
+  lock shared with prep. prep deletes the files 10 minutes later, after any
+  toy still playing it is done.
+- **Conversion progress** comes from `state/prep-status.json`, which prep
+  writes atomically at most every 2 s.
+
+prep changes that came with it:
+- It rescans `source/` after every video and converts the newest file first,
+  so a video added while a long batch runs doesn't wait for the batch.
+- It checks free space before starting ffmpeg (worst-case bytes per hour per
+  track, plus 300 MB).
+- It remembers failed files (by mtime, size and settings) and only retries
+  them when they change or with `--force`. "Not enough space" is always
+  retried.
+- It deletes a rebuilt video's previous version 6 h after the rebuild.
+- It discards a build whose source was removed meanwhile.
+
+## How prep runs FFmpeg
+
+Bookworm's FFmpeg 5.1 runs one process's work mostly one step after another,
+so a single `ffmpeg` that decodes, encodes two video tracks and normalises the
+sound kept fewer than 2 of the Pi's 4 cores busy. Audio and video simply took
+turns. prep now runs these side by side (`build_ffmpeg_jobs`, `run_encode`):
+
+- **video:** decodes and scales the source once and encodes the H.264 track.
+  It passes the picture to a second `ffmpeg` that encodes the MPEG-1 track,
+  as raw video through a pipe.
+- **audio:** runs `loudnorm` once (it used to run once per audio format) and
+  encodes Opus and MP3.
+
+The output is the same as before: video segments and MP3 are byte-identical,
+and the Opus audio decodes to the same samples. Only the Ogg stream serial
+number differs, and it is random anyway.
+
+Speed, measured on a 4-core PC: about 2x faster, 53-57% less time, at the same
+quality. Estimated for a Pi 4, not measured: a 10-minute 480p YouTube video
+takes about 6-10 minutes instead of about 18. If any of the processes fails
+or stalls, or prep is stopped, all of them are stopped, and the error from
+the one that failed is reported.
+
+Possible later steps:
+- A faster x264 setting (`me=dia:subme=1`) saves about another 10% for 3-8%
+  bigger files. It would change the settings hash, and that rebuilds the
+  whole library.
+- A static loudness gain instead of `loudnorm` is cheaper, but it changes the
+  sound of every video.
+- The Pi 4's hardware H.264 encoder is untested and absent on a Pi 5.
+
 ## Encoding on another computer
 
 Encoding is faster on a desktop (needs Python 3, FFmpeg, `pip install av`):
@@ -108,6 +213,11 @@ node tools/e2e-robust.js http://127.0.0.1/     # size change, missing segment, d
                                                # lip-sync offset, Back while loading, racing seeks
 node tools/e2e-diag.js http://127.0.0.1/
 tools/make_diag_clips.py                            # regenerates site/diag/clips
+tools/test_add.py       # add-videos service + real prep, fake yt-dlp: PIN, uploads (resume, cut-off
+                        # pieces, chunked), links, errors, yt-dlp update+retry, playlists, removal, keys
+tools/e2e-add.sh        # the page at phone size through Caddy (spare ports): paste, 3-piece upload,
+                        # toy picks it up by itself, removal, share target, Funnel port can't reach /add/
+tools/test_hotspot.sh   # hotspot scripts against a fake NetworkManager
 ```
 
 `e2e.js` reads the frame number back off the canvas after every draw, and

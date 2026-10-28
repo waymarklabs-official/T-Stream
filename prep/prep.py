@@ -23,6 +23,11 @@ Usage:
     prep.py --only "Animals/*"   # rebuild only matching items (glob on relative path)
     prep.py --prune              # also delete media whose source file is gone
     prep.py --catalog-only       # just rebuild catalog.json from existing media
+
+Newest files are converted first, and files that arrive during a run are
+picked up by the same run. What prep is doing goes to ROOT/state/prep-status.json
+(read by the add-videos page); files that failed are remembered there and only
+retried when they change (or with --force).
 """
 
 import argparse
@@ -34,6 +39,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,6 +83,18 @@ DEFAULT_CONFIG = {
     "hotspot": {"ssid": "CanvasPlayer", "password": "change-me-please", "country": "US"},
 }
 
+# Disk space one hour of video takes while it converts, per track at 480p:
+# the encoded intermediate plus the finished segments, i.e. twice the size of
+# detailed 3D animation (measured 0.67 GB/h H.264, 1.3 GB/h MPEG-1; flat
+# cartoons are a third of that). Unusually busy video can need more; ffmpeg
+# then fails cleanly with "no space" and the file is tried again next run.
+CONVERT_BYTES_PER_HOUR = {"h264": 1.4e9, "vp9": 1.4e9, "vp8": 2.2e9, "mpeg1": 2.6e9}
+AUDIO_BYTES_PER_HOUR = 0.15e9
+SPACE_RESERVE = 300 * 1000 * 1000  # never fill the card completely
+
+KEEP_PREVIOUS_BUILD_HOURS = 6  # a toy may still be playing the build before a rebuild
+REMOVED_GRACE_MINUTES = 10     # a removed video's files stay this long (it may be playing)
+
 AUDIO_FORMATS = {
     "opus": {"file": "audio.opus", "mime": "audio/ogg; codecs=opus"},
     "mp3": {"file": "audio.mp3", "mime": "audio/mpeg"},
@@ -115,7 +133,7 @@ def load_config(path):
 
 def prep_key(cfg):
     """Hash of every setting that changes the encoded output."""
-    relevant = {k: v for k, v in cfg.items() if k not in ("player", "hotspot", "remote")}
+    relevant = {k: v for k, v in cfg.items() if k not in ("player", "hotspot", "remote", "add")}
     relevant["_v"] = PREP_VERSION
     return hashlib.sha1(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -127,7 +145,12 @@ def natural_key(s):
 
 
 def clean_title(stem):
-    t = re.sub(r"[._]+", " ", stem)
+    # Underscores are always spaces. Dots are too in "Peppa.Pig.S01E01"
+    # style names, but not in a title with more spaces than dots ("Mr. Men").
+    words = re.sub(r"[\[\(\{][^\]\)\}]*[\]\)\}]", "", stem).strip()
+    t = stem.replace("_", " ")
+    if words.count(".") > words.count(" "):
+        t = t.replace(".", " ")
     # drop release-style tags like [1080p], (x264), {WEB-DL}
     t = re.sub(r"[\[\(\{][^\]\)\}]*\b(\d{3,4}p|x26[45]|h\.?26[45]|hevc|web|dl|rip|bluray|aac|ac3|uhd|hdr)\b[^\]\)\}]*[\]\)\}]",
                "", t, flags=re.I)
@@ -266,9 +289,25 @@ def video_codec_args(kind, cfg, gop):
     raise ValueError(kind)
 
 
-def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
-    """One ffmpeg run decodes the source once and writes every video track
-    plus every audio format, all aligned to start at t=0."""
+FF_HEAD = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error"]
+NO_META = ["-map_metadata", "-1", "-map_chapters", "-1"]
+
+
+def build_ffmpeg_jobs(src, info, cfg, fps, tmp, duration):
+    """The ffmpeg runs that make every video track and every audio format,
+    all aligned to start at t=0, run side by side by run_encode():
+
+        video  decodes and scales the source once, encodes the first track,
+               and hands the picture to one more ffmpeg per extra track
+               through a pipe (raw video); "{fd<i>}" marks where
+        audio  normalises the sound once and encodes every audio format
+
+    ffmpeg 5.1 (Bookworm) runs one process's work mostly one step after
+    another, so this is about twice as fast on a Pi, with the same output.
+    Without fd passing (Windows) each track decodes the source itself.
+
+    Returns (video_cmds, audio_cmd, outputs).
+    """
     streams = info.get("streams", [])
     vstreams = [s for s in streams if s.get("codec_type") == "video"
                 and not s.get("disposition", {}).get("attached_pic")]
@@ -289,8 +328,42 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
     offset = start(vstreams[0].get("start_time")) - start(info.get("format", {}).get("start_time"))
     shift = "PTS-%.6f/TB" % offset
 
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
-           "-progress", "pipe:1", "-nostats", "-i", src]
+    h = int(cfg["height"])
+    tracks = cfg["videoTracks"]
+    fps_s = "%d/%d" % (fps.numerator, fps.denominator)
+    # "height" caps the short side, so upright phone videos and YouTube
+    # Shorts get 480 x 852, not 270 x 480 (same pixels as a wide video):
+    # out_h = min(ih * m, H) / m with m = min(dar, 1); out_w = out_h * dar
+    oh = "min(ih*min(dar\\,1)\\,%d)/min(dar\\,1)" % h
+    chain = ("[0:%d]setpts=%s,yadif=deint=interlaced,"
+             "scale=w='trunc(%s*dar/2)*2':h='trunc(%s/2)*2':flags=bicubic,"
+             "setsar=1,fps=fps=%s:start_time=0,format=yuv420p" % (vi, shift, oh, oh, fps_s))
+    gop = max(1, int(round(float(fps) * float(cfg["keyframeSeconds"]))))
+    outputs = {kind: os.path.join(tmp, "%s.mkv" % kind) for kind in tracks}
+
+    def encode(kind):
+        return (["-an", "-sn", "-dn"] + NO_META + video_codec_args(kind, cfg, gop)
+                + ["-max_muxing_queue_size", "4096", "-f", "matroska", outputs[kind]])
+
+    progress = ["-progress", "pipe:1", "-nostats"]
+    video_cmds = []
+    if len(tracks) > 1 and os.name == "posix":
+        labels = "".join("[v%d]" % i for i in range(len(tracks)))
+        first = FF_HEAD + progress + ["-i", src, "-filter_complex",
+                                      chain + ",split=%d%s" % (len(tracks), labels), "-map", "[v0]"]
+        first += encode(tracks[0])
+        for i in range(1, len(tracks)):
+            first += ["-map", "[v%d]" % i, "-an", "-sn", "-dn", "-c:v", "rawvideo", "-f", "nut", "{fd%d}" % i]
+        video_cmds.append(first)
+        for kind in tracks[1:]:
+            video_cmds.append(FF_HEAD + ["-f", "nut", "-i", "pipe:0", "-map", "0:v"] + encode(kind))
+    else:
+        for i, kind in enumerate(tracks):
+            video_cmds.append(FF_HEAD + (progress if i == 0 else []) + ["-i", src, "-filter_complex",
+                                                                        chain + "[v]", "-map", "[v]"]
+                              + encode(kind))
+
+    audio_cmd = FF_HEAD + progress + ["-i", src]
     if astreams:
         amap = "0:%d" % astreams[0]["index"]
     else:
@@ -298,99 +371,133 @@ def build_ffmpeg_cmd(src, info, cfg, fps, tmp, duration):
         # item needs one.
         if not duration:
             raise RuntimeError("cannot tell how long this video is")
-        cmd += ["-f", "lavfi", "-t", "%.3f" % duration, "-i", "anullsrc=r=48000:cl=stereo"]
+        audio_cmd += ["-f", "lavfi", "-t", "%.3f" % duration, "-i", "anullsrc=r=48000:cl=stereo"]
         amap = "1:a"
-
-    h = int(cfg["height"])
-    tracks = cfg["videoTracks"]
-    fps_s = "%d/%d" % (fps.numerator, fps.denominator)
-    chain = ("[0:%d]setpts=%s,yadif=deint=interlaced,"
-             "scale=w='trunc(min(ih\\,%d)*dar/2)*2':h='trunc(min(ih\\,%d)/2)*2':flags=bicubic,"
-             "setsar=1,fps=fps=%s:start_time=0,format=yuv420p" % (vi, shift, h, h, fps_s))
-    labels = ["v%d" % i for i in range(len(tracks))]
-    if len(tracks) > 1:
-        chain += ",split=%d%s" % (len(tracks), "".join("[%s]" % l for l in labels))
-    else:
-        chain += "[%s]" % labels[0]
-    cmd += ["-filter_complex", chain]
-
-    gop = max(1, int(round(float(fps) * float(cfg["keyframeSeconds"]))))
-    outputs = {}
-    for kind, label in zip(tracks, labels):
-        path = os.path.join(tmp, "%s.mkv" % kind)
-        cmd += ["-map", "[%s]" % label, "-an", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
-        cmd += video_codec_args(kind, cfg, gop)
-        cmd += ["-max_muxing_queue_size", "4096", "-f", "matroska", path]
-        outputs[kind] = path
-
-    for fmt in cfg["audioFormats"]:
-        rate = 48000 if fmt == "opus" else 44100
-        af = ["asetpts=%s" % shift if astreams else "anull", "aresample=async=1:first_pts=0"]
-        if cfg["normalizeAudio"] and astreams:
-            if duration:
-                # loudnorm needs 3 s of input (shorter silence turns into NaN,
-                # which crashes the MP3 encoder): pad first, trim back after.
-                af += ["apad=whole_dur=%.3f" % max(duration, 3.5), "loudnorm=I=-18:TP=-2:LRA=11",
-                       "atrim=end=%.3f" % duration]
-            else:
-                af.append("loudnorm=I=-18:TP=-2:LRA=11")
-        elif duration:
-            af.append("apad=whole_dur=%.3f" % duration)
-        af.append("aresample=%d" % rate)
-        path = os.path.join(tmp, AUDIO_FORMATS[fmt]["file"])
-        cmd += ["-map", amap, "-vn", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
-                "-af", ",".join(af), "-ac", "2"]
-        if fmt == "opus":
-            cmd += ["-c:a", "libopus", "-b:a", cfg["opusBitrate"], "-f", "ogg"]
+    af = ["asetpts=%s" % shift if astreams else "anull", "aresample=async=1:first_pts=0"]
+    if cfg["normalizeAudio"] and astreams:
+        if duration:
+            # loudnorm needs 3 s of input (shorter silence turns into NaN,
+            # which crashes the MP3 encoder): pad first, trim back after.
+            af += ["apad=whole_dur=%.3f" % max(duration, 3.5), "loudnorm=I=-18:TP=-2:LRA=11",
+                   "atrim=end=%.3f" % duration]
         else:
-            cmd += ["-c:a", "libmp3lame", "-b:a", cfg["mp3Bitrate"], "-f", "mp3"]
-        cmd += ["-max_muxing_queue_size", "4096", path]
+            af.append("loudnorm=I=-18:TP=-2:LRA=11")
+    elif duration:
+        af.append("apad=whole_dur=%.3f" % duration)
+    fmts = cfg["audioFormats"]
+    graph = "[%s]%s,asplit=%d%s" % (amap, ",".join(af), len(fmts), "".join("[s%d]" % i for i in range(len(fmts))))
+    for i, fmt in enumerate(fmts):
+        graph += ";[s%d]aresample=%d[a%d]" % (i, 48000 if fmt == "opus" else 44100, i)
+    audio_cmd += ["-filter_complex", graph]
+    for i, fmt in enumerate(fmts):
+        path = os.path.join(tmp, AUDIO_FORMATS[fmt]["file"])
+        audio_cmd += ["-map", "[a%d]" % i, "-vn", "-sn", "-dn"] + NO_META + ["-ac", "2"]
+        if fmt == "opus":
+            audio_cmd += ["-c:a", "libopus", "-b:a", cfg["opusBitrate"], "-f", "ogg"]
+        else:
+            audio_cmd += ["-c:a", "libmp3lame", "-b:a", cfg["mp3Bitrate"], "-f", "mp3"]
+        audio_cmd += ["-max_muxing_queue_size", "4096", path]
         outputs[fmt] = path
-    return cmd, outputs
+    return video_cmds, audio_cmd, outputs
 
 
 STALL_SECONDS = 900
 
 
-def run_ffmpeg_with_progress(cmd, duration, label):
-    # stderr goes to a file: a damaged source can print megabytes of decode
-    # errors, which would fill a pipe nobody reads and hang ffmpeg forever.
-    errf = tempfile.TemporaryFile()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, encoding="utf-8", errors="replace")
-    last = -1
-    start = time.time()
-    alive = [time.time(), False]
+def run_encode(video_cmds, audio_cmd, duration, label, progress=None):
+    """Runs the video and audio ffmpegs side by side. Progress comes from
+    the first video process; if any process fails, stalls, or we are
+    stopped, all of them are stopped."""
+    procs = []  # (name, process, stderr file)
+    lock = threading.Lock()
+    alive = {"video": time.time(), "audio": time.time()}
+    stalled = []
 
-    def watchdog():  # kill ffmpeg if it stops making progress (stuck input)
-        while p.poll() is None:
-            if time.time() - alive[0] > STALL_SECONDS:
-                alive[1] = True
-                p.kill()
-                return
-            time.sleep(5)
-    threading.Thread(target=watchdog, daemon=True).start()
+    def launch(name, cmd, **kw):
+        # stderr goes to a file: a damaged source can print megabytes of
+        # decode errors, which would fill a pipe nobody reads and hang ffmpeg.
+        errf = tempfile.TemporaryFile()
+        p = subprocess.Popen(cmd, stderr=errf, **kw)
+        with lock:
+            procs.append((name, p, errf))
+        return p
 
-    for line in p.stdout:
-        alive[0] = time.time()
-        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
-            try:
-                t = int(line.split("=", 1)[1]) / 1e6
-            except ValueError:
-                continue
-            if duration:
+    def stop_all():
+        with lock:
+            for _, p, _ in procs:
+                if p.poll() is None:
+                    p.kill()
+
+    def follow(p, name, report=None):
+        """Reads ffmpeg's -progress lines; any line means it is still working."""
+        last, t0 = -1, time.time()
+        for line in p.stdout:
+            alive[name] = time.time()
+            if report and (line.startswith("out_time_us=") or line.startswith("out_time_ms=")) and duration:
+                try:
+                    t = int(line.split("=", 1)[1]) / 1e6
+                except ValueError:
+                    continue
                 pct = int(min(99, t * 100 / duration))
+                if progress:
+                    progress(pct)
                 if pct >= last + 10:
                     last = pct
-                    speed = t / max(0.001, time.time() - start)
-                    log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, speed))
-    p.wait()
-    errf.seek(0)
-    err = errf.read().decode("utf-8", "replace")
-    errf.close()
-    if alive[1]:
+                    log("    %s: %3d%%  (%.1fx realtime)" % (label, pct, t / max(0.001, time.time() - t0)))
+        p.wait()
+        if p.returncode != 0:
+            stop_all()  # one failed: the rest can't make a whole item
+
+    def watchdog():  # kill everything if a part stops making progress (stuck input)
+        while any(p.poll() is None for _, p, _ in list(procs)):
+            for name in ("video", "audio"):
+                running = any(n == name and p.poll() is None for n, p, _ in list(procs))
+                if running and time.time() - alive[name] > STALL_SECONDS:
+                    stalled.append(name)
+                    stop_all()
+                    return
+            time.sleep(5)
+
+    try:
+        first = list(video_cmds[0])
+        pipes = []
+        for i in range(1, len(video_cmds)):
+            if "{fd%d}" % i in first:  # the first process feeds this one through a pipe
+                r, w = os.pipe()
+                first[first.index("{fd%d}" % i)] = "pipe:%d" % w
+                pipes.append((r, w))
+        main = launch("video", first, stdout=subprocess.PIPE, pass_fds=[w for _, w in pipes],
+                      encoding="utf-8", errors="replace")
+        for i, cmd in enumerate(video_cmds[1:]):
+            if pipes:
+                r, w = pipes[i]
+                os.close(w)  # only the first process writes
+                launch("video", cmd, stdin=r, stdout=subprocess.DEVNULL)
+                os.close(r)
+            else:
+                launch("video", cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        audio = launch("audio", audio_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       encoding="utf-8", errors="replace")
+        threading.Thread(target=watchdog, daemon=True).start()
+        at = threading.Thread(target=follow, args=(audio, "audio"), daemon=True)
+        at.start()
+        follow(main, "video", report=True)
+        at.join()
+        for _, p, _ in procs:
+            p.wait()
+    finally:
+        stop_all()  # we were stopped (Ctrl-C, systemd): stop ffmpeg too
+    errs = []
+    for name, p, errf in procs:
+        errf.seek(0)
+        err = errf.read().decode("utf-8", "replace").strip()
+        errf.close()
+        if p.returncode != 0:
+            errs.append("[%s] %s" % (name, err[-1500:] or "exit %s" % p.returncode))
+    if stalled:
         raise RuntimeError("ffmpeg made no progress for %d minutes and was stopped" % (STALL_SECONDS // 60))
-    if p.returncode != 0:
-        raise RuntimeError("ffmpeg failed:\n%s" % err.strip()[-2000:])
+    if errs:
+        raise RuntimeError("ffmpeg failed:\n%s" % "\n".join(errs)[-3000:])
 
 
 def make_thumb(video_path, duration, width, out_path):
@@ -405,13 +512,34 @@ def make_thumb(video_path, duration, width, out_path):
             raise RuntimeError("thumbnail failed: %s" % p.stderr.strip()[-500:])
 
 
-def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
+class NoSpace(Exception):
+    """Not enough free space to convert this video now (retried every run)."""
+
+
+class Gone(Exception):
+    """The source file was removed while it was converting."""
+
+
+def space_needed(cfg, duration, size):
+    """Bytes a conversion may need while it runs, with a margin."""
+    if not duration:  # unknown length: guess from the file size
+        return 2 * size + SPACE_RESERVE
+    scale = max(0.25, (float(cfg["height"]) / 480) ** 2)
+    per_hour = AUDIO_BYTES_PER_HOUR + scale * sum(CONVERT_BYTES_PER_HOUR.get(k, 4e9) for k in cfg["videoTracks"])
+    return int(per_hour * duration / 3600) + SPACE_RESERVE
+
+
+def gb(n):
+    return "%.1f GB" % (n / 1e9)
+
+
+def build_item(src, rel, category, out_dir, cfg, key, mtime, size, progress=None):
     """Encodes one video into out_dir/<stamp>/... plus out_dir/manifest.json.
 
     Every build gets its own <stamp> folder, so a toy that is still playing
     the previous build keeps reading the previous files (same URLs would
     otherwise mix old and new encodings). The previous build is kept next to
-    the new one; older ones are deleted.
+    the new one for a few hours (see remove_old_builds); older ones go now.
     """
     iid = os.path.basename(out_dir)
     media_dir = os.path.dirname(out_dir)
@@ -429,12 +557,16 @@ def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
         src_fps = parse_rate(vstreams[0].get("avg_frame_rate")) or parse_rate(vstreams[0].get("r_frame_rate"))
         fps = choose_fps(src_fps, cfg["maxFps"])
         duration = source_duration(info, src)
+        need, free = space_needed(cfg, duration, size), shutil.disk_usage(media_dir).free
+        if free < need:
+            raise NoSpace("not enough free space on the Pi: converting this video needs about %s, %s is free"
+                          % (gb(need), gb(free)))
 
-        cmd, outputs = build_ffmpeg_cmd(src, info, cfg, fps, vdir, duration)
+        video_cmds, audio_cmd, outputs = build_ffmpeg_jobs(src, info, cfg, fps, vdir, duration)
         log("    encoding %s @ %s fps -> %s + %s" % (
             "x".join(str(x) for x in (vstreams[0].get("width"), vstreams[0].get("height"))),
             "%.3f" % float(fps), "+".join(cfg["videoTracks"]), "+".join(cfg["audioFormats"])))
-        run_ffmpeg_with_progress(cmd, duration, "encode")
+        run_encode(video_cmds, audio_cmd, duration, "encode", progress)
 
         tracks = []
         for kind in cfg["videoTracks"]:
@@ -473,6 +605,8 @@ def build_item(src, rel, category, out_dir, cfg, key, mtime, size):
         with open(os.path.join(tmp, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=1)
 
+        if not os.path.exists(src):  # removed on the add-videos page meanwhile
+            raise Gone()
         # Keep the build a toy may be playing right now, then swap.
         if os.path.isdir(out_dir):
             prev = read_manifest(os.path.join(out_dir, "manifest.json"))
@@ -517,10 +651,98 @@ def read_manifest(path):
         return None
 
 
+def write_json(path, data):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def remove_old_builds(media_dir, now):
+    """Delete the previous build of rebuilt videos once no toy can still be
+    playing it, and the files of videos removed on the add-videos page."""
+    for d in os.listdir(media_dir):
+        item = os.path.join(media_dir, d)
+        if d.startswith(".") or not os.path.isdir(item):
+            continue
+        marker = os.path.join(item, REMOVED)
+        try:
+            if now - os.stat(marker).st_mtime > REMOVED_GRACE_MINUTES * 60:
+                log("removing %s (removed on the add-videos page)" % d)
+                shutil.rmtree(item, ignore_errors=True)
+            continue
+        except OSError:
+            pass
+        mpath = os.path.join(item, "manifest.json")
+        m = read_manifest(mpath)
+        try:
+            # a clock that jumped back makes the age negative: keep
+            if not m or now - os.stat(mpath).st_mtime < KEEP_PREVIOUS_BUILD_HOURS * 3600:
+                continue
+        except OSError:
+            continue
+        for sub in os.listdir(item):
+            if sub != m.get("v") and re.match(r"^[0-9a-f]{8}$", sub) and os.path.isdir(os.path.join(item, sub)):
+                shutil.rmtree(os.path.join(item, sub), ignore_errors=True)
+
+
+class Status:
+    """STATE/prep-status.json: what prep is doing, for the add-videos page.
+
+    It also remembers which files failed, so a broken file is not converted
+    again every 15 minutes: it is tried again when it changes, or with --force.
+    """
+
+    def __init__(self, state_dir, key):
+        self.path = os.path.join(state_dir, "prep-status.json") if state_dir else None
+        self.key = key
+        self.last = 0.0
+        old = (read_manifest(self.path) if self.path else None) or {}
+        self.data = {"running": True, "pid": os.getpid(), "current": None, "pending": [],
+                     "failed": old.get("failed") if isinstance(old.get("failed"), dict) else {}}
+
+    def known_failure(self, rel, mtime, size):
+        f = self.data["failed"].get(rel)
+        return bool(f and not f.get("retry") and f.get("key") == self.key
+                    and f.get("mtime") == mtime and f.get("size") == size)
+
+    def fail(self, rel, mtime, size, error, retry=False):
+        self.data["failed"][rel] = {"mtime": mtime, "size": size, "key": self.key, "retry": retry,
+                                    "error": str(error).strip()[-600:],
+                                    "at": datetime.datetime.now().isoformat(timespec="seconds")}
+
+    def forget(self, keep=None, rel=None):
+        if rel is not None:
+            self.data["failed"].pop(rel, None)
+        if keep is not None:  # files that no longer exist
+            for r in [r for r in self.data["failed"] if r not in keep]:
+                del self.data["failed"][r]
+
+    def set(self, force=True, **kw):
+        self.data.update(kw)
+        if self.path and (force or time.time() - self.last >= 2):
+            self.last = time.time()
+            self.data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            try:
+                write_json(self.path, self.data)
+            except OSError as e:
+                log("could not write %s: %s" % (self.path, e))
+
+
+REMOVED = ".removed"  # marker file in an item folder: removed on the add-videos page
+
+
 def build_catalog(media_dir, cfg):
+    # The add-videos page rebuilds the catalog too (after a removal), so one
+    # writer at a time; whoever writes last saw the newest state.
+    with Lock(os.path.join(media_dir, ".catalog.lock")):
+        return _build_catalog(media_dir, cfg)
+
+
+def _build_catalog(media_dir, cfg):
     cats = {}
     for d in os.listdir(media_dir):
-        if d.startswith("."):
+        if d.startswith(".") or os.path.exists(os.path.join(media_dir, d, REMOVED)):
             continue
         m = read_manifest(os.path.join(media_dir, d, "manifest.json"))
         if not m:
@@ -541,7 +763,7 @@ def build_catalog(media_dir, cfg):
         "categories": [{"name": name, "items": [i for _, i in sorted(cats[name], key=lambda x: x[0])]}
                        for name in sorted(cats, key=natural_key)],
     }
-    tmp = os.path.join(media_dir, ".catalog.json.tmp")
+    tmp = os.path.join(media_dir, ".catalog.json.%d.tmp" % os.getpid())
     with open(tmp, "w") as f:
         json.dump(catalog, f, indent=1)
     os.replace(tmp, os.path.join(media_dir, "catalog.json"))
@@ -553,9 +775,10 @@ class Busy(Exception):
 
 
 class Lock:
-    def __init__(self, path, wait=True):
+    def __init__(self, path, wait=True, say=None):
         self.path = path
         self.wait = wait
+        self.say = say
         self.f = None
 
     def __enter__(self):
@@ -570,7 +793,8 @@ class Lock:
             if not self.wait:
                 self.f.close()
                 raise Busy()
-            log("another prep is running; waiting for it to finish...")
+            if self.say:
+                log(self.say)
             fcntl.flock(self.f, fcntl.LOCK_EX)
         return self
 
@@ -592,30 +816,49 @@ def main(argv=None):
     ap.add_argument("--no-wait", action="store_true", help="exit instead of waiting when another prep is running")
     ap.add_argument("--settle", type=int, default=60,
                     help="skip files modified in the last N seconds (still copying). Default 60")
+    ap.add_argument("--state", help="folder for prep-status.json (default ROOT/state when ROOT is an install)")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # never crash on printing an odd file name
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
 
+    # stopped by systemd (service restart, shutdown): clean up like Ctrl-C
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(143))
     root = args.root or (DEFAULT_ROOT if os.path.isdir(DEFAULT_ROOT) else REPO_DIR)
     source_dir = os.path.abspath(args.source or os.path.join(root, "source"))
     media_dir = os.path.abspath(args.media or os.path.join(root, "site", "media"))
     config_path = args.config or os.path.join(root, "config.json")
     if not os.path.exists(config_path):
         config_path = os.path.join(REPO_DIR, "config.json")
-    cfg = load_config(config_path)
-    key = prep_key(cfg)
-    os.makedirs(media_dir, exist_ok=True)
-
+    state_dir = args.state
+    if state_dir is None and (args.root or root == DEFAULT_ROOT):
+        state_dir = os.path.join(root, "state")
     try:
-        with Lock(os.path.join(media_dir, ".prep.lock"), wait=not args.no_wait):
-            return run_prep(args, cfg, key, source_dir, media_dir, config_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        cfg = load_config(config_path)
+        key = prep_key(cfg)
+        os.makedirs(media_dir, exist_ok=True)
+        with Lock(os.path.join(media_dir, ".prep.lock"), wait=not args.no_wait,
+                  say="another prep is running; waiting for it to finish..."):
+            return run_prep(args, cfg, key, source_dir, media_dir, config_path, state_dir)
     except Busy:
         log("a conversion is running right now; the library list updates when it finishes")
         return 0
+    except SystemExit as e:  # can't run at all (no FFmpeg, bad config.json): tell the add page
+        if state_dir and isinstance(e.code, str):
+            path = os.path.join(state_dir, "prep-status.json")
+            st = read_manifest(path) or {}
+            st.update(running=False, current=None, error=e.code, updated=datetime.datetime.now().isoformat(
+                timespec="seconds"))
+            try:
+                write_json(path, st)
+            except OSError:
+                pass
+        raise
 
 
-def run_prep(args, cfg, key, source_dir, media_dir, config_path):
+def run_prep(args, cfg, key, source_dir, media_dir, config_path, state_dir=None):
     if args.catalog_only:
         cat = build_catalog(media_dir, cfg)
         log("catalog: %d categories, %d items" % (len(cat["categories"]),
@@ -629,51 +872,116 @@ def run_prep(args, cfg, key, source_dir, media_dir, config_path):
     for d in os.listdir(media_dir):  # leftovers from an interrupted run
         if d.startswith(".tmp-") or d.startswith(".old-"):
             shutil.rmtree(os.path.join(media_dir, d), ignore_errors=True)
+    remove_old_builds(media_dir, time.time())
 
-    sources = scan_sources(source_dir)
-    built = skipped = failed = waiting = 0
+    status = Status(state_dir, key)
+    status.set()
+    try:
+        return prep_loop(args, cfg, key, source_dir, media_dir, status)
+    finally:
+        status.set(running=False, current=None, pending=[])
+
+
+def prep_loop(args, cfg, key, source_dir, media_dir, status):
+    built = skipped = failed = waiting = earlier = 0
     failures = []
-    now = time.time()
-    for i, (path, rel, category) in enumerate(sources, 1):
-        if args.only and not fnmatch.fnmatch(rel.replace(os.sep, "/"), args.only):
-            continue
-        try:
-            st = os.stat(path)  # can vanish mid-run, or be a dangling link
-            iid = item_id(rel)
-        except (OSError, ValueError) as e:
-            failed += 1
-            failures.append(readable(rel))
-            log("[%d/%d] %s: FAILED: %s" % (i, len(sources), readable(rel), e))
-            continue
-        mtime, size = int(st.st_mtime), st.st_size
-        out_dir = os.path.join(media_dir, iid)
-        m = read_manifest(os.path.join(out_dir, "manifest.json"))
-        fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime
-                 and m.get("source", {}).get("size") == size)
-        if fresh and not (args.force or args.only):
-            skipped += 1
-            continue
-        if now - st.st_mtime < args.settle:
-            log("[%d/%d] %s: modified %ds ago, maybe still copying - will pick it up next run"
-                % (i, len(sources), readable(rel), now - st.st_mtime))
-            waiting += 1
-            continue
-        log("[%d/%d] %s  (%s, id %s)" % (i, len(sources), readable(rel), readable(category), iid))
+    decided = {}   # rel -> (mtime, size): skipped, built or failed in this run
+    pending = {}   # rel -> (mtime, size, path, category, iid)
+    settling = set()
+    redo = args.force or args.only
+    while True:
+        # Scan again after every video: files that arrive meanwhile (from the
+        # add-videos page) join this run, and the newest file goes first.
+        sources = scan_sources(source_dir)
+        present = set()
+        now = time.time()
+        for path, rel, category in sources:
+            if args.only and not fnmatch.fnmatch(rel.replace(os.sep, "/"), args.only):
+                continue
+            name = readable(rel.replace(os.sep, "/"))
+            present.add(rel)
+            try:
+                st = os.stat(path)  # can vanish mid-run, or be a dangling link
+                iid = item_id(rel)
+            except (OSError, ValueError) as e:
+                if decided.get(rel) != "error":
+                    decided[rel] = "error"
+                    failed += 1
+                    failures.append(name)
+                    log("%s: FAILED: %s" % (name, e))
+                continue
+            mtime, size = int(st.st_mtime), st.st_size
+            if decided.get(rel) == (mtime, size) or pending.get(rel, ())[:2] == (mtime, size):
+                continue
+            pending.pop(rel, None)  # it changed since it was queued: look at it afresh
+            out_dir = os.path.join(media_dir, iid)
+            m = read_manifest(os.path.join(out_dir, "manifest.json"))
+            fresh = (m and m.get("prepKey") == key and m.get("source", {}).get("mtime") == mtime
+                     and m.get("source", {}).get("size") == size
+                     and not os.path.exists(os.path.join(out_dir, REMOVED)))
+            if fresh and not redo:
+                decided[rel] = (mtime, size)
+                skipped += 1
+                continue
+            if now - st.st_mtime < args.settle:
+                if rel not in settling:
+                    settling.add(rel)
+                    waiting += 1
+                    log("%s: modified %ds ago, maybe still copying - will pick it up next run"
+                        % (name, now - st.st_mtime))
+                continue
+            if status.known_failure(name, mtime, size) and not redo:
+                decided[rel] = (mtime, size)
+                earlier += 1
+                continue
+            pending[rel] = (mtime, size, path, category, iid)
+        for rel in [r for r in pending if r not in present]:
+            del pending[rel]  # removed before its turn
+        if not pending:
+            break
+
+        rel = max(pending, key=lambda r: (pending[r][0], r))
+        mtime, size, path, category, iid = pending.pop(rel)
+        decided[rel] = (mtime, size)
+        settling.discard(rel)
+        name = readable(rel.replace(os.sep, "/"))
+        n = built + failed + 1
+        log("[%d/%d] %s  (%s, id %s)" % (n, n + len(pending), name, readable(category), iid))
+        status.set(current={"path": name, "id": iid, "pct": 0},
+                   pending=[readable(r.replace(os.sep, "/"))
+                            for r in sorted(pending, key=lambda r: -pending[r][0])])
+
+        def progress(pct, name=name, iid=iid):
+            status.set(force=False, current={"path": name, "id": iid, "pct": pct})
+
         t0 = time.time()
         try:
-            build_item(path, rel, category, out_dir, cfg, key, mtime, size)
+            build_item(path, rel, category, os.path.join(media_dir, iid), cfg, key, mtime, size, progress)
             built += 1
+            status.forget(rel=name)
             log("    done in %.0fs" % (time.time() - t0))
             build_catalog(media_dir, cfg)  # new items appear as soon as they are ready
         except KeyboardInterrupt:
             log("interrupted")
             build_catalog(media_dir, cfg)
             return 130
+        except Gone:
+            log("    removed while converting; discarded")
+        except NoSpace as e:  # tried again next run, maybe after videos were removed
+            failed += 1
+            failures.append(name)
+            status.fail(name, mtime, size, e, retry=True)
+            log("    FAILED: %s" % e)
         except Exception as e:  # keep going with the rest of the library
             failed += 1
-            failures.append(readable(rel))
+            failures.append(name)
+            full = "no space left on device" in str(e).lower()  # tried again next run, like NoSpace
+            status.fail(name, mtime, size, "not enough free space on the Pi" if full else e, retry=full)
             log("    FAILED: %s" % e)
+        status.set(current=None)
 
+    if not args.only:
+        status.forget(keep={readable(r.replace(os.sep, "/")) for _, r, _ in sources})
     if args.prune:
         if not sources:
             log("prune: source folder is empty - refusing to prune everything")
@@ -693,6 +1001,8 @@ def run_prep(args, cfg, key, source_dir, media_dir, config_path):
         % (built, skipped, failed, waiting, total, len(cat["categories"])))
     for f in failures:
         log("  failed: %s" % f)
+    if earlier:
+        log("  %d file(s) failed in an earlier run and did not change since (prep --force tries again)" % earlier)
     return 1 if failed else 0
 
 

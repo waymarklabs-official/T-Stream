@@ -2,7 +2,25 @@
 # T-Stream status and help.
 #   tstream          status + list of commands
 #   tstream update   download the newest version and reinstall (keeps videos/config)
+#   tstream new-pin  new PIN for the add-videos page (logs out every phone)
 ROOT=${CANVAS_ROOT:-/srv/canvas-player}
+
+if [ "${1:-}" = new-pin ]; then
+  [ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
+  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
+  pin=$(python3 -c 'import secrets; print("%08d" % secrets.randbelow(10**8))')
+  # written as the owner: state/ is the owner's, and root following a link
+  # planted there would write wherever it points
+  if ! runuser -u "$owner" -- sh -c 'umask 077; echo "$1" > "$2" && echo "{}" > "$3"' \
+      sh "$pin" "$ROOT/state/add-pin.txt" "$ROOT/state/add-sessions.json"; then
+    echo "Could not save a new PIN in $ROOT/state (the old one still works)."
+    exit 1
+  fi
+  systemctl try-restart tstream-add.service 2>/dev/null || true
+  echo "New PIN for the add-videos page: $pin"
+  echo "Every phone and iPhone Shortcut has to log in again (Shortcuts: make a new key on the page)."
+  exit 0
+fi
 
 if [ "${1:-}" = update ]; then
   if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx TStream-Hotspot; then
@@ -52,6 +70,52 @@ except (OSError, ValueError, KeyError):
     print("  \033[31m%-14s\033[0m empty - put videos in %s/source and run: prep" % ("library", root))
 PYEOF
 if systemctl is-active --quiet canvas-prep.timer; then ok "auto-convert" "every 15 min (new files in $ROOT/source)"; fi
+if systemctl is-active --quiet tstream-add.service; then
+  pin=$(cat "$ROOT/state/add-pin.txt" 2>/dev/null || echo "see: sudo tstream")
+  ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v ':' | grep -v '^$' | head -1)
+  ok "add videos" "http://${ip:-<pi-address>}/add/   PIN $pin"
+  if [ -s "$ROOT/state/add-https-url.txt" ]; then
+    ok "" "$(cat "$ROOT/state/add-https-url.txt")   (phone with Tailscale on; Android: install it to share from YouTube)"
+  fi
+else
+  bad "add videos" "NOT running (sudo systemctl restart tstream-add; log: journalctl -u tstream-add)"
+fi
+python3 - "$ROOT" <<'PYEOF2'
+import json, os, shutil, sys
+root = sys.argv[1]
+try:
+    free = shutil.disk_usage(os.path.join(root, "site", "media")).free
+except OSError:
+    sys.exit(0)
+st = {}
+try:
+    st = json.load(open(os.path.join(root, "state", "prep-status.json")))
+except (OSError, ValueError):
+    pass
+line = "%.1f GB free" % (free / 1e9)
+try:  # a prep stopped by a power cut never said it stopped
+    os.kill(int(st.get("pid")), 0)
+except ProcessLookupError:
+    st["running"] = False
+except (PermissionError, TypeError, ValueError):
+    pass
+if st.get("running") and st.get("current"):
+    c = st["current"]
+    line += "; converting %s (%d%%), %d waiting" % (c.get("path"), c.get("pct", 0), len(st.get("pending") or []))
+failed = [k for k, v in (st.get("failed") or {}).items() if not v.get("retry")]
+if failed:
+    line += "; %d file(s) could not be converted (see prep.log)" % len(failed)
+if st.get("error") and not st.get("running"):
+    line += "; converting can't start: %s" % st["error"]
+try:
+    f = json.load(open(os.path.join(root, "state", "add-pin-fails.json")))
+    fails = f.get("count", 0) if f.get("pin") == os.stat(os.path.join(root, "state", "add-pin.txt")).st_mtime else 0
+    if fails:
+        line += "\n  %-14s %d wrong PIN(s) tried on the add-videos page since the PIN was made" % ("", fails)
+except (OSError, ValueError):
+    pass
+print("  \033[32m%-14s\033[0m %s" % ("space", line))
+PYEOF2
 if [ -r "$ROOT/remote-url.txt" ]; then
   ok "remote" "ON  -> $(cat "$ROOT/remote-url.txt")"
 elif [ -e "$ROOT/remote-url.txt" ]; then
@@ -73,5 +137,6 @@ Commands:
   tstream         this screen
   remote-on       watch from anywhere with internet (Tailscale, secret link; nothing on the toy)
   remote-off      stop remote access
+  tstream new-pin new PIN for the add-videos page (logs every phone out)
   tstream update  get the newest version and reinstall (keeps videos and settings)
 EOF

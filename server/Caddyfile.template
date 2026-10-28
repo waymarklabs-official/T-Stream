@@ -1,7 +1,8 @@
 # T-Stream / canvas player - written by caddy-config (install.sh, remote-on).
 # Serves @ROOT@/site over plain HTTP (:80) and HTTPS (:443) with a local
 # certificate authority, so the toy can use either; plus a localhost-only port
-# for remote access through Tailscale Funnel (remote-on).
+# for remote access through Tailscale Funnel (remote-on). /add/ is the
+# add-videos page for the parent's phone (never on the Funnel port).
 {
 	# keep plain http:// working; never redirect it to https://
 	auto_https disable_redirects
@@ -66,7 +67,27 @@
 
 (tstream) {
 	import tstream-log
-	import tstream-files
+	# The add-videos page for the parent's phone (add/addserver.py). Only from
+	# the home network, the hotspot and Tailscale (tailscale serve arrives from
+	# 127.0.0.1); the :8099 site below, which Funnel puts on the internet, does
+	# not import this.
+	@add path /add /add/*
+	handle @add {
+		# global IPv6 (2000::/3) gets through to the page, which only accepts
+		# addresses from the Pi's own home network
+		@outside not remote_ip 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 ::1/128 fc00::/7 fe80::/10 2000::/3
+		respond @outside 403
+		# never through Tailscale Funnel, should it ever be turned on for this port
+		@funnel header Tailscale-Funnel-Request *
+		respond @funnel 403
+		request_body {
+			max_size 20MB
+		}
+		reverse_proxy 127.0.0.1:8098
+	}
+	handle {
+		import tstream-files
+	}
 }
 
 http:// {

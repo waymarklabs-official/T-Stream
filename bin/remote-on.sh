@@ -9,6 +9,11 @@
 #                          shows a QR code to log the Pi into your account)
 #   remote-on --new-link   make a new secret link; the old one stops working
 #   remote-off             turn it off again
+#
+# It also puts the add-videos page on https://<pi>.<tailnet>.ts.net/add/ for
+# your own Tailscale devices only (never the internet): Android needs https to
+# list "Add videos" in YouTube's Share menu. (remote-on --add-page does only
+# that part; install.sh runs it when Tailscale is up.)
 set -euo pipefail
 ROOT=${CANVAS_ROOT:-/srv/canvas-player}
 CONF="$ROOT/config.json"
@@ -17,6 +22,57 @@ LOCAL=http://127.0.0.1:8099   # Caddy's secret-link-only port (see the Caddyfile
 URL_FILE="$ROOT/remote-url.txt"
 
 [ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
+
+# https://<pi>.<tailnet>.ts.net/ -> Caddy's plain-http site, for tailnet
+# devices only (tailscale serve, not funnel; the toy's Funnel stays on 8443).
+add_page_https() {
+  local dns conflict
+  dns=$(tailscale status --json 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null) || return 1
+  [ -n "$dns" ] || return 1
+  conflict=$(tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    cfg = json.load(sys.stdin) or {}
+except ValueError:
+    cfg = {}
+for hp, web in (cfg.get("Web") or {}).items():
+    if hp.endswith(":443"):
+        for path, h in (web.get("Handlers") or {}).items():
+            if h.get("Proxy") != "http://127.0.0.1:80":
+                print(path)
+' 2>/dev/null || true)
+  if [ -n "$conflict" ]; then
+    echo "(Tailscale already serves something else on https port 443; the add-videos page stays on http.)"
+    return 1
+  fi
+  local owner url_file="$ROOT/state/add-https-url.txt"
+  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
+  # 0 can also mean "HTTPS is not on for your tailnet" (it prints a link to
+  # turn it on), so check that the setting is really there
+  out=$(timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80 2>&1) || true
+  if ! tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+cfg = json.load(sys.stdin) or {}
+h = ((cfg.get("Web") or {}).get(sys.argv[1] + ":443") or {}).get("Handlers") or {}
+sys.exit(0 if (h.get("/") or {}).get("Proxy") == "http://127.0.0.1:80" else 1)
+' "$dns" 2>/dev/null; then
+    runuser -u "$owner" -- rm -f "$url_file"
+    [ -z "$out" ] || echo "$out" | grep -i "https\|enable\|visit" | head -3
+    return 1
+  fi
+  # written as the owner (state/ is the owner's folder)
+  runuser -u "$owner" -- sh -c 'printf "https://%s/add/\n" "$1" > "$2"' sh "$dns" "$url_file"
+}
+
+if [ "${1:-}" = --add-page ]; then
+  if add_page_https; then
+    echo "Add videos over Tailscale: $(cat "$ROOT/state/add-https-url.txt")"
+  else
+    echo "(The https add-videos address is not set up: Tailscale is not ready, or HTTPS is off for your tailnet. remote-on sets it up.)"
+  fi
+  exit 0
+fi
 
 if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx TStream-Hotspot; then
   echo "The Pi is in hotspot mode, so it has no internet. Remote access needs the Pi"
@@ -107,4 +163,7 @@ Remote access is ON.
   New link: remote-on --new-link     Turn off: remote-off
   Diagnostics over this link: ${url}diag.html
 EOF
+if add_page_https; then
+  echo "  Add videos from your phone (with Tailscale on): $(cat "$ROOT/state/add-https-url.txt")"
+fi
 [ -n "$ok" ] || echo "(The link did not answer from the Pi itself yet; give it a minute, then try it on the toy.)"

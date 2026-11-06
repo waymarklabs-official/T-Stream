@@ -118,10 +118,14 @@ http://:8099 {
 	import tstream-log
 	redir /k/@REMOTE_KEY@ /k/@REMOTE_KEY@/
 	handle_path /k/@REMOTE_KEY@/* {
+		# the add-videos page is never on this public link: say where it is
+		# (an empty 404 makes Safari save it as a file)
+		@add path /add /add/*
+		respond @add "The add-videos page is not on the toy's link. On your phone, with Tailscale on, open the Pi's Tailscale address followed by /add/ (the command tstream on the Pi shows it)." 404
 		import tstream-files
 	}
 	handle {
-		respond 404
+		respond "Not found" 404
 	}
 }
 

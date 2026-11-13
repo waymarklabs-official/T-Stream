@@ -96,6 +96,16 @@ must be in the Pi's own /64), and the Host name: an IP address, the Pi's
 name with a home-network suffix (`.local`, `.lan`, ...), or its ts.net name.
 So a web page elsewhere can't aim its own domain at the Pi (DNS rebinding).
 
+Over Tailscale the page also has an https address,
+`https://<pi>.<tailnet>.ts.net:8444/add/`. It is made with `tailscale serve`,
+visible to tailnet devices only, and points at Caddy's plain-http site; Android
+needs https to offer the page in the share menu. It is deliberately not on
+port 443. Newer `tailscaled` versions really listen on the Tailscale address
+for every served port, and Caddy, which listens on 443 on every address, then
+can't start (or restart, or come up after a reboot if tailscaled wins the
+race). `remote-on --add-page` moves an old 443 setup to 8444. It warns about
+anything else on 443, as do `tstream` and `install.sh`.
+
 - **Access:** an 8-digit PIN (`state/add-pin.txt`). Wrong PINs are limited
   to 5 per address per 5 minutes and 100 in all for one PIN; after that only
   `tstream new-pin` helps. That caps a guesser's chance at 1 in a million.

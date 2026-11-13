@@ -58,7 +58,7 @@ it). Pick the category the video should go in on the toy, then:
   from where they stopped when you come back to the page.
 - **Share straight from the YouTube app**, without copy and paste:
   - **Android:** with Tailscale on the phone, open the Pi's
-    `https://<pi>.<tailnet>.ts.net/add/` address (shown under **Help and
+    `https://<pi>.<tailnet>.ts.net:8444/add/` address (shown under **Help and
     settings**, and by `tstream`) in Chrome and tap **⋮ → Install app**. From
     then on YouTube's **Share** menu lists **Add videos**.
   - **iPhone:** make a **Send to toy** Shortcut once (5 minutes); the steps,

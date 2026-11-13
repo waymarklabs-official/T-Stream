@@ -49,6 +49,9 @@ bad() { printf '  \033[31m%-14s\033[0m %s\n' "$1" "$2"; }
 
 echo "T-Stream canvas player"
 if systemctl is-active --quiet caddy; then ok "web server" "running"; else bad "web server" "NOT running (sudo systemctl restart caddy)"; fi
+if ss -Hltnp 'sport = :443' 2>/dev/null | grep -q tailscaled; then
+  bad "port 443" "taken by tailscale serve: the web server can't restart. Fix: sudo tailscale serve --https=443 off"
+fi
 if nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep -q '^TStream-Hotspot:'; then
   ok "hotspot" "ON  -> toy uses http://10.42.0.1/"
 else

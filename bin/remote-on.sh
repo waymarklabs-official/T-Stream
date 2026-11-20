@@ -10,7 +10,7 @@
 #   remote-on --new-link   make a new secret link; the old one stops working
 #   remote-off             turn it off again
 #
-# It also puts the add-videos page on https://<pi>.<tailnet>.ts.net/add/ for
+# It also puts the add-videos page on https://<pi>.<tailnet>.ts.net:8444/add/ for
 # your own Tailscale devices only (never the internet): Android needs https to
 # list "Add videos" in YouTube's Share menu. (remote-on --add-page does only
 # that part; install.sh runs it when Tailscale is up.)
@@ -23,46 +23,60 @@ URL_FILE="$ROOT/remote-url.txt"
 
 [ "$(id -u)" -eq 0 ] || exec sudo CANVAS_ROOT="$ROOT" "$0" "$@"
 
-# https://<pi>.<tailnet>.ts.net/ -> Caddy's plain-http site, for tailnet
+# https://<pi>.<tailnet>.ts.net:8444/ -> Caddy's plain-http site, for tailnet
 # devices only (tailscale serve, not funnel; the toy's Funnel stays on 8443).
-add_page_https() {
-  local dns conflict
-  dns=$(tailscale status --json 2>/dev/null |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null) || return 1
-  [ -n "$dns" ] || return 1
-  conflict=$(tailscale serve status --json 2>/dev/null | python3 -c '
+# Never port 443: tailscaled then holds 443 on the Tailscale address, and
+# Caddy, which listens on 443 everywhere, can't start (after a reboot too).
+ADD_PORT=8444
+serve_json() {
+  tailscale serve status --json 2>/dev/null || echo '{}'
+}
+# the proxy target Tailscale serves at <host>:<port>/, or nothing
+served_at() {
+  serve_json | python3 -c '
 import json, sys
 try:
     cfg = json.load(sys.stdin) or {}
 except ValueError:
     cfg = {}
-for hp, web in (cfg.get("Web") or {}).items():
-    if hp.endswith(":443"):
-        for path, h in (web.get("Handlers") or {}).items():
-            if h.get("Proxy") != "http://127.0.0.1:80":
-                print(path)
-' 2>/dev/null || true)
-  if [ -n "$conflict" ]; then
-    echo "(Tailscale already serves something else on https port 443; the add-videos page stays on http.)"
+h = ((cfg.get("Web") or {}).get(sys.argv[1]) or {}).get("Handlers") or {}
+print((h.get("/") or {}).get("Proxy") or "")
+' "$1" 2>/dev/null || true
+}
+add_page_https() {
+  local dns owner out on443 url_file="$ROOT/state/add-https-url.txt"
+  dns=$(tailscale status --json 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null) || return 1
+  [ -n "$dns" ] || return 1
+  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
+  # earlier versions put the page on 443: move it
+  on443=$(served_at "$dns:443")
+  if [ "$on443" = "http://127.0.0.1:80" ]; then
+    tailscale serve --https=443 off >/dev/null 2>&1 || true
+    on443=""
+  fi
+  if [ -n "$on443" ]; then
+    echo "!! Tailscale serves $on443 on https port 443. That stops Caddy (the toy's web server)"
+    echo "   from starting after a reboot. Give that app another port:"
+    echo "     sudo tailscale serve --https=443 off"
+    echo "     sudo tailscale serve --bg --https=<another port> $on443"
+  fi
+  local here
+  here=$(served_at "$dns:$ADD_PORT")
+  if [ -n "$here" ] && [ "$here" != "http://127.0.0.1:80" ]; then
+    echo "(Tailscale already serves something else on port $ADD_PORT; the add-videos page stays on http.)"
     return 1
   fi
-  local owner url_file="$ROOT/state/add-https-url.txt"
-  owner=$(cat "$ROOT/.owner" 2>/dev/null || echo root)
   # 0 can also mean "HTTPS is not on for your tailnet" (it prints a link to
   # turn it on), so check that the setting is really there
-  out=$(timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80 2>&1) || true
-  if ! tailscale serve status --json 2>/dev/null | python3 -c '
-import json, sys
-cfg = json.load(sys.stdin) or {}
-h = ((cfg.get("Web") or {}).get(sys.argv[1] + ":443") or {}).get("Handlers") or {}
-sys.exit(0 if (h.get("/") or {}).get("Proxy") == "http://127.0.0.1:80" else 1)
-' "$dns" 2>/dev/null; then
+  out=$(timeout 30 tailscale serve --bg --https=$ADD_PORT http://127.0.0.1:80 2>&1) || true
+  if [ "$(served_at "$dns:$ADD_PORT")" != "http://127.0.0.1:80" ]; then
     runuser -u "$owner" -- rm -f "$url_file"
     [ -z "$out" ] || echo "$out" | grep -i "https\|enable\|visit" | head -3
     return 1
   fi
   # written as the owner (state/ is the owner's folder)
-  runuser -u "$owner" -- sh -c 'printf "https://%s/add/\n" "$1" > "$2"' sh "$dns" "$url_file"
+  runuser -u "$owner" -- sh -c 'printf "https://%s:%s/add/\n" "$1" "$2" > "$3"' sh "$dns" "$ADD_PORT" "$url_file"
 }
 
 if [ "${1:-}" = --add-page ]; then

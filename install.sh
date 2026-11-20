@@ -118,7 +118,10 @@ sudo -u "$OWNER" python3 "$ROOT/bin/prep.py" --root "$ROOT" --catalog-only --no-
 step "Configuring the Caddy web server"
 for port in 80 443; do
   other=$(ss -Hltnp "sport = :$port" 2>/dev/null | grep -v caddy || true)
-  if [ -n "$other" ]; then
+  if grep -q tailscaled <<<"$other"; then
+    warn "Tailscale serves something on port $port (tailscale serve), so Caddy can't start."
+    warn "Move it to another port: sudo tailscale serve --https=$port off, then serve it on e.g. --https=8445"
+  elif [ -n "$other" ]; then
     warn "Port $port is already used by another program:"
     echo "$other"
     warn "Caddy cannot start until that program stops using port $port (Kodi's web interface uses 8080, which is fine)."
